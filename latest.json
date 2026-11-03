@@ -1,7 +1,7 @@
 {
-  "version": "0.2.1",
-  "url": "https://github.com/FR-HL/DarkerLab-Releases/releases/download/v0.2.1/DarkerLab.Launcher.Gui.exe",
-  "sha256": "f6402013ba417e1216d6cb0b2936da41fccc5258f0855b978982cc19d5bb11d6",
-  "size": 189912212,
-  "notes": "DarkerLab 启动器 v0.2.1"
+  "version": "0.2.2",
+  "url": "https://github.com/FR-HL/DarkerLab-Releases/releases/download/v0.2.2/DarkerLab.Launcher.Gui.exe",
+  "sha256": "f4c44fef6ae04df7f5917dccd1080be010f6e6a02c9c053a577e9ddce61cfaa6",
+  "size": 189916308,
+  "notes": "增加更新线路选择：自动、GitHub 主线路、服务器备用。"
 }
