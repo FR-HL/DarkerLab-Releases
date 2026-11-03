@@ -1,7 +1,7 @@
 {
-  "version": "0.2.3",
-  "url": "https://github.com/FR-HL/DarkerLab-Releases/releases/download/v0.2.3/DarkerLab.Launcher.Gui.exe",
-  "sha256": "7fae8f95e5a2b9866f12bc5324c2b940b905b75ba5282ea5f03fdb99eeb2bd7a",
+  "version": "0.2.4",
+  "url": "https://github.com/FR-HL/DarkerLab-Releases/releases/download/v0.2.4/DarkerLab0.2.4.exe",
+  "sha256": "1bb088a89c71c72bc533d713d80e56c5c19c45652e3457bed8e4801c92f626fc",
   "size": 189916308,
-  "notes": "修复 Windows PowerShell 5.1 读取无 BOM UTF-8 脚本导致的中文解析错误。"
+  "notes": "方案 C：用户启动链改用 C#，移除运行时 PowerShell/JSON 编码依赖；启动初始化异步化。"
 }
