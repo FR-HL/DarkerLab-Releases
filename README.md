@@ -4,11 +4,23 @@
 
 ## 下载
 
-最新版本：
+打开最新 Release 页面：
 
-[DarkerLab.Launcher.Gui.exe](https://github.com/FR-HL/DarkerLab-Releases/releases/latest/download/DarkerLab.Launcher.Gui.exe)
+[Releases](https://github.com/FR-HL/DarkerLab-Releases/releases/latest)
 
-历史版本请在 [Releases](https://github.com/FR-HL/DarkerLab-Releases/releases) 中选择对应版本。
+每个版本的文件名为：
+
+```text
+DarkerLab<版本>.exe
+```
+
+例如：
+
+```text
+DarkerLab0.2.3.exe
+```
+
+历史版本请在 [Releases](https://github.com/FR-HL/DarkerLab-Releases/releases) 中选择。
 
 ## 系统要求
 
@@ -40,7 +52,7 @@ GitHub 主线路
 ## 更新
 
 1. 关闭正在运行的 DarkerLab 和游戏。
-2. 下载新的 `DarkerLab.Launcher.Gui.exe`。
+2. 下载新的 `DarkerLab<版本>.exe`，例如 `DarkerLab0.2.3.exe`。
 3. 覆盖原启动器 EXE，保持启动器所在目录不变。
 4. 重新启动启动器；如果版本说明要求，执行一次“安装/修复”。
 
@@ -58,7 +70,7 @@ GitHub 主线路
 下载后可自行校验：
 
 ```powershell
-Get-FileHash .\DarkerLab.Launcher.Gui.exe -Algorithm SHA256
+Get-FileHash .\DarkerLab<版本>.exe -Algorithm SHA256
 ```
 
 ## 发布说明
