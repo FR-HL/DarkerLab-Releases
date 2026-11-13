@@ -1,0 +1,190 @@
+-- Republish the original shape memory into an empty owned wheel.
+-- The original class row already enumerates every Druid form; this module only
+-- calls the native RepNotify once, after the same preconditions the original
+-- widget expects. It never writes slot data, SkillComponent state or abilities.
+local M = {}
+
+local ATTEMPTS = _G.__DARKERLAB_SHAPE_MEMORY or {}
+_G.__DARKERLAB_SHAPE_MEMORY = ATTEMPTS
+
+local function read(fn)
+  local ok, value = pcall(fn)
+  if ok then return value end
+end
+local function valid(object)
+  return read(function() return object and object:IsValid() end) == true
+end
+local function text(value)
+  return read(function() return value:ToString() end)
+end
+local function tag(value)
+  local name = read(function() return value.TagName end)
+  return name and text(name) or nil
+end
+local function address(object)
+  return valid(object) and read(function() return object:GetAddress() end) or nil
+end
+local function same(left, right)
+  local a, b = address(left), address(right)
+  return a ~= nil and b ~= nil and a == b
+end
+local function log(message)
+  print('[NATIVE-SHAPE] ' .. tostring(message))
+end
+local function remember(key, state)
+  if not ATTEMPTS[key] or ATTEMPTS[key].status ~= state.status then
+    log(state.status .. (state.populated and (' populated=' .. state.populated) or ''))
+  end
+  ATTEMPTS[key] = state
+end
+local function prune()
+  local count = 0
+  for _ in pairs(ATTEMPTS) do count = count + 1 end
+  if count > 64 then
+    for key in pairs(ATTEMPTS) do ATTEMPTS[key] = nil end
+  end
+end
+
+local function visibleWheels(pawn, world)
+  local out = {}
+  local list = read(function() return FindAllOf('GameShapeShiftSelectGroupWidget') end) or {}
+  for index = 1, #list do
+    local wheel = list[index]
+    if valid(wheel)
+      and same(read(function() return wheel:GetOwningPlayerPawn() end), pawn)
+      and same(read(function() return wheel:GetWorld() end), world) then
+      local visibility = read(function() return wheel:GetVisibility() end)
+      if visibility == 0 or visibility == 3 or visibility == 4 then
+        out[#out + 1] = wheel
+      end
+    end
+  end
+  return out
+end
+
+local function activeCast(pawn)
+  local asc = read(function() return pawn.AbilitySystemComponent end)
+  local items = read(function() return asc.ActivatableAbilities.Items end)
+  local count = read(function() return #items end) or 0
+  for index = 1, count do
+    local spec = read(function() return items[index]:get() end) or items[index]
+    for _, field in ipairs({'NonReplicatedInstances','ReplicatedInstances'}) do
+      local instances = read(function() return spec[field] end)
+      local size = read(function() return #instances end) or 0
+      for slot = 1, size do
+        local ability = read(function() return instances[slot]:get() end) or instances[slot]
+        if valid(ability)
+          and read(function() return ability.bIsActive end) == true
+          and read(function() return ability:IsA('/Script/DungeonCrawler.GA_PlayerShapeShiftCastBase') end) == true then
+          return true
+        end
+      end
+    end
+  end
+  return false
+end
+
+local function populatedSlots(wheel)
+  local slots = read(function() return wheel.ShapeShiftSlots end)
+  local count = read(function() return #slots end) or 0
+  local populated = 0
+  for index = 1, count do
+    local slot = read(function() return slots[index]:get() end) or slots[index]
+    if valid(slot) then
+      local id = read(function() return text(slot.ShapeShiftData.ShapeShiftId.PrimaryAssetName) end)
+      if id and id ~= '' and id ~= 'None' then populated = populated + 1 end
+    end
+  end
+  return populated, count
+end
+
+function M.tick(pawn)
+  if not valid(pawn) then return 'no_player' end
+  if read(function() return pawn.CharacterKey.CharacterClass end) ~= 9 then return 'not_druid' end
+  if read(function() return pawn.bIsDead end) == true then return 'dead' end
+  if read(function() return pawn:IsLocallyControlled() end) ~= true then return 'not_local' end
+  if read(function() return pawn:GetLocalRole() end) ~= 3 then return 'not_authority' end
+  local world = read(function() return pawn:GetWorld() end)
+  if not valid(world) then return 'no_world' end
+  if valid(read(function() return world.NetDriver end)) then return 'networked' end
+
+  local key = tostring(address(pawn)) .. '|' .. tostring(address(world))
+  local state = ATTEMPTS[key]
+  local now = os.clock()
+  if state then
+    if state.nextAt then
+      if now < state.nextAt then return state.status or 'waiting' end
+    elseif state.status then
+      return state.status
+    end
+  end
+
+  local memory = read(function() return pawn.ClassShapeShiftComponent end)
+  local skills = read(function() return pawn.SkillComponent end)
+  if not (valid(memory) and valid(skills)) then return 'no_components' end
+  if not same(read(function() return memory:GetOwner() end), pawn) then return 'memory_owner_mismatch' end
+  if not same(read(function() return skills:GetOwner() end), pawn) then return 'skill_owner_mismatch' end
+
+  local rows = read(function() return memory.ShapeShiftDatas end)
+  local rowCount = read(function() return #rows end) or 0
+  if rowCount == 0 then return 'memory_empty' end
+  if rowCount > 16 then return 'memory_bound_exceeded' end
+  for index = 1, rowCount do
+    local row = read(function() return rows[index]:get() end) or rows[index]
+    local id = read(function() return text(row.ShapeShiftId.PrimaryAssetName) end)
+    local rowTag = tag(row.ShapeShiftTag)
+    if not (id and id:match('^Id_ShapeShift_[%w_]+$')) then return 'memory_identity_invalid' end
+    if not (rowTag and rowTag:match('^Ability%.ShapeShift%.')) then return 'memory_tag_invalid' end
+  end
+
+  local account = read(function() return skills.AccountSkillDatas end)
+  local accountCount = read(function() return #account end) or 0
+  if accountCount > 2 then return 'account_bound_exceeded' end
+
+  local wheels = visibleWheels(pawn, world)
+  if #wheels == 0 then
+    remember(key, {status='wheel_missing', nextAt=now + 1})
+    return 'wheel_missing'
+  end
+  if #wheels > 1 then return 'wheel_ambiguous' end
+  local wheel = wheels[1]
+  local bank = read(function() return wheel.WidgetSlotType end)
+  if bank ~= 1 and bank ~= 2 then return 'wheel_bank_missing' end
+  local skill = read(function() return account[bank] end)
+  local skillTag = skill and tag(skill.SkillTag) or nil
+  if not (skillTag and skillTag:match('^Ability%.Player%.Skill%.ShapeShiftMemory[12]$')) then
+    return 'wheel_not_memory'
+  end
+
+  local populated, slotCount = populatedSlots(wheel)
+  if slotCount ~= 5 then return 'wheel_slots_incomplete' end
+  if populated > 0 then
+    remember(key, {status='wheel_already_populated', populated=populated})
+    return 'wheel_already_populated'
+  end
+  if activeCast(pawn) then
+    remember(key, {status='cast_active', nextAt=now + 1})
+    return 'cast_active'
+  end
+
+  remember(key, {status='attempted'})
+  prune()
+  local ok, failure = pcall(function() memory:OnRep_ShapeShiftDatas() end)
+  if not ok then
+    remember(key, {status='notify_failed', error=tostring(failure)})
+    return 'notify_failed'
+  end
+  populated = populatedSlots(wheel)
+  if populated > 0 then
+    remember(key, {status='republished', populated=populated})
+    return 'republished'
+  end
+  remember(key, {status='still_empty'})
+  return 'still_empty'
+end
+
+function M.cancel()
+  for key in pairs(ATTEMPTS) do ATTEMPTS[key] = nil end
+end
+
+return M

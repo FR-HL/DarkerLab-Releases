@@ -1,0 +1,285 @@
+"use strict";
+
+// Server-owned persistence for the offline character profile and training
+// loadouts. The game/Lua side never opens this database directly.
+const fs = require("node:fs");
+const path = require("node:path");
+const { DatabaseSync } = require("node:sqlite");
+
+const databases = new Map();
+const SCHEMA = `
+CREATE TABLE IF NOT EXISTS characters (
+  id TEXT PRIMARY KEY,
+  build TEXT NOT NULL,
+  nickname TEXT NOT NULL,
+  gender INTEGER NOT NULL,
+  class_name TEXT NOT NULL,
+  training_class_index INTEGER,
+  equipped_json TEXT NOT NULL,
+  layout_json TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS loadouts (
+  character_id TEXT NOT NULL,
+  class_index INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  auto INTEGER NOT NULL DEFAULT 0,
+  record_count INTEGER NOT NULL DEFAULT 0,
+  records TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (character_id, class_index, name)
+);
+CREATE TABLE IF NOT EXISTS meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+`;
+
+function database(root) {
+  const key = path.resolve(root);
+  const existing = databases.get(key);
+  if (existing) return existing.db;
+  const dir = path.join(key, "user");
+  fs.mkdirSync(dir, { recursive: true });
+  const db = new DatabaseSync(path.join(dir, "darkerlab.db"));
+  db.exec("PRAGMA journal_mode = DELETE");
+  db.exec("PRAGMA synchronous = NORMAL");
+  db.exec(SCHEMA);
+  db.exec("PRAGMA user_version = 2");
+  const entry = { db, migrated: false };
+  databases.set(key, entry);
+  migrateLegacy(key, db);
+  entry.migrated = true;
+  return db;
+}
+
+function now() {
+  return new Date().toISOString();
+}
+
+function metaGet(db, key) {
+  const row = db.prepare("SELECT value FROM meta WHERE key = ?").get(key);
+  return row ? row.value : null;
+}
+
+function metaSet(db, key, value) {
+  db.prepare("INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(key, String(value));
+}
+
+function readLegacy(file) {
+  if (!fs.existsSync(file)) return null;
+  return JSON.parse(fs.readFileSync(file, "utf8"));
+}
+
+function migrateLegacy(root, db) {
+  if (metaGet(db, "legacy_migrated")) return;
+  const user = path.join(root, "user");
+  const profileFile = path.join(user, "character-profile.json");
+  const selectedFile = path.join(user, "selected-class.json");
+  const loadoutsFile = path.join(user, "loadouts.json");
+  const gameRoot = process.env.DARKERLAB_GAME_PATH || path.join(root, "game", "Dark and Darker-NoAC");
+  const legacyProfile = path.join(gameRoot, "DungeonCrawler", "Binaries", "Win64", "ue4ss", "Mods", "TrainingCamp", "character-profile.json");
+
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const selected = readLegacy(selectedFile);
+    const selectedIndex = Number(selected?.classIndex) || 0;
+    if (selectedIndex >= 1 && selectedIndex <= 10) metaSet(db, "pending_training_class:1", selectedIndex);
+
+    const profile = readLegacy(profileFile) || readLegacy(legacyProfile);
+    if (profile && typeof profile.className === "string" && profile.equipped) {
+      saveCharacter(root, profile, db);
+    }
+
+    const loadouts = readLegacy(loadoutsFile);
+    if (loadouts && Array.isArray(loadouts.presets)) {
+      for (const row of loadouts.presets) {
+        const classIndex = Number(row?.class);
+        const name = String(row?.name || "").trim();
+        const records = String(row?.records || "");
+        if (classIndex < 1 || classIndex > 10 || !name || !records) {
+          throw new Error("invalid legacy loadout entry");
+        }
+        saveLoadout(root, {
+          classIndex,
+          name,
+          auto: row.auto === true,
+          count: Number(row.count) || 1,
+          records,
+          allowBuildMismatch: true,
+        }, db);
+      }
+    }
+
+    metaSet(db, "legacy_migrated", now());
+    db.exec("COMMIT");
+  } catch (error) {
+    try { db.exec("ROLLBACK"); } catch { }
+    throw new Error("legacy profile migration failed; old files were kept: " + error.message);
+  }
+
+  for (const file of [profileFile, selectedFile, loadoutsFile]) {
+    try { fs.rmSync(file, { force: true }); } catch { }
+  }
+}
+
+function characterId(value) {
+  const id = String(value || "1").trim();
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) throw new Error("invalid character id");
+  return id;
+}
+
+function pendingKey(id) {
+  return "pending_training_class:" + id;
+}
+
+function getCharacterRow(root, id = "1") {
+  return database(root).prepare("SELECT * FROM characters WHERE id = ?").get(characterId(id));
+}
+
+function getCharacter(root, id = "1") {
+  const key = characterId(id);
+  const db = database(root);
+  const row = getCharacterRow(root, key);
+  if (!row) return null;
+  let equipped = {};
+  let layout = {};
+  try { equipped = JSON.parse(row.equipped_json); } catch { }
+  try { layout = JSON.parse(row.layout_json); } catch { }
+  const pending = Number(metaGet(db, pendingKey(key))) || 0;
+  return {
+    version: 1,
+    build: row.build,
+    characterId: row.id,
+    nickname: row.nickname,
+    gender: row.gender,
+    className: row.class_name,
+    trainingClassIndex: row.training_class_index || pending || undefined,
+    equipped,
+    layout,
+  };
+}
+
+function saveCharacter(root, profile, suppliedDb) {
+  const db = suppliedDb || database(root);
+  const id = characterId(profile.characterId || "1");
+  const existing = db.prepare("SELECT training_class_index FROM characters WHERE id = ?").get(id);
+  const pending = Number(metaGet(db, pendingKey(id))) || 0;
+  const training = (existing && existing.training_class_index) || pending || null;
+  db.prepare(`
+    INSERT INTO characters(id,build,nickname,gender,class_name,training_class_index,equipped_json,layout_json,updated_at)
+    VALUES(?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(id) DO UPDATE SET
+      build=excluded.build,
+      nickname=excluded.nickname,
+      gender=excluded.gender,
+      class_name=excluded.class_name,
+      training_class_index=excluded.training_class_index,
+      equipped_json=excluded.equipped_json,
+      layout_json=excluded.layout_json,
+      updated_at=excluded.updated_at
+  `).run(
+    id,
+    String(profile.build || ""),
+    String(profile.nickname || "OfflinePlayer"),
+    Number.isInteger(profile.gender) ? profile.gender : 0,
+    String(profile.className || "Fighter"),
+    training,
+    JSON.stringify(profile.equipped || {}),
+    JSON.stringify(profile.layout || {}),
+    now()
+  );
+  if (pending) metaSet(db, pendingKey(id), "");
+  return getCharacter(root, id);
+}
+
+function deleteCharacter(root, id = "1") {
+  const key = characterId(id);
+  const db = database(root);
+  db.prepare("DELETE FROM characters WHERE id = ?").run(key);
+  db.prepare("DELETE FROM loadouts WHERE character_id = ?").run(key);
+  metaSet(db, pendingKey(key), "");
+}
+
+function getTrainingClass(root, id = "1") {
+  const key = characterId(id);
+  const db = database(root);
+  const row = db.prepare("SELECT training_class_index AS value FROM characters WHERE id = ?").get(key);
+  const pending = Number(metaGet(db, pendingKey(key))) || 0;
+  return Number(row?.value) || pending || 4;
+}
+
+function setTrainingClass(root, index, id = "1") {
+  const value = Number(index);
+  if (!Number.isInteger(value) || value < 1 || value > 10) throw new Error("training class index must be 1-10");
+  const key = characterId(id);
+  const db = database(root);
+  const row = db.prepare("SELECT id FROM characters WHERE id = ?").get(key);
+  if (row) {
+    db.prepare("UPDATE characters SET training_class_index = ?, updated_at = ? WHERE id = ?").run(value, now(), key);
+  } else {
+    metaSet(db, pendingKey(key), value);
+  }
+  return value;
+}
+
+function listLoadouts(root, classIndex, id = "1") {
+  const value = Number(classIndex);
+  if (!Number.isInteger(value) || value < 1 || value > 10) throw new Error("class index must be 1-10");
+  return database(root).prepare("SELECT name, record_count AS count, auto FROM loadouts WHERE character_id = ? AND class_index = ? ORDER BY auto DESC, name").all(characterId(id), value)
+    .map((row) => ({ name: row.name, count: row.count, auto: row.auto === 1 }));
+}
+
+function getLoadout(root, classIndex, name, id = "1") {
+  const value = Number(classIndex);
+  if (!Number.isInteger(value) || value < 1 || value > 10) throw new Error("class index must be 1-10");
+  const row = database(root).prepare("SELECT name, record_count AS count, auto, records FROM loadouts WHERE character_id = ? AND class_index = ? AND name = ?").get(characterId(id), value, String(name));
+  return row ? { name: row.name, count: row.count, auto: row.auto === 1, records: row.records } : null;
+}
+
+function saveLoadout(root, loadout, suppliedDb) {
+  const db = suppliedDb || database(root);
+  const id = characterId(loadout.characterId || "1");
+  const classIndex = Number(loadout.classIndex);
+  const name = String(loadout.name || "").trim();
+  const records = String(loadout.records || "");
+  const count = Number(loadout.count) || 1;
+  if (!Number.isInteger(classIndex) || classIndex < 1 || classIndex > 10) throw new Error("class index must be 1-10");
+  if (!name || name.length > 64) throw new Error("loadout name must be 1-64 characters");
+  if (!records) throw new Error("loadout records are required");
+  if (records.length > 4 * 1024 * 1024) throw new Error("loadout records exceed 4 MiB");
+  const header = records.split(/\r?\n/, 1)[0].split("\t");
+  if (header[0] !== "DARKERLAB_LOADOUT_V1") throw new Error("invalid loadout header");
+  if (Number(header[2]) !== classIndex) throw new Error("loadout header class mismatch");
+  const expectedBuild = process.env.DARKERLAB_GAME_BUILD || "";
+  if (!loadout.allowBuildMismatch && expectedBuild && header[1] && header[1] !== expectedBuild) throw new Error("loadout build mismatch");
+  db.prepare(`
+    INSERT INTO loadouts(character_id,class_index,name,auto,record_count,records,updated_at)
+    VALUES(?,?,?,?,?,?,?)
+    ON CONFLICT(character_id,class_index,name) DO UPDATE SET
+      auto=excluded.auto,
+      record_count=excluded.record_count,
+      records=excluded.records,
+      updated_at=excluded.updated_at
+  `).run(id, classIndex, name, loadout.auto ? 1 : 0, count, records, now());
+  return getLoadout(root, classIndex, name, id);
+}
+
+function deleteLoadout(root, classIndex, name, id = "1") {
+  const value = Number(classIndex);
+  if (!Number.isInteger(value) || value < 1 || value > 10) throw new Error("class index must be 1-10");
+  return database(root).prepare("DELETE FROM loadouts WHERE character_id = ? AND class_index = ? AND name = ?").run(characterId(id), value, String(name)).changes > 0;
+}
+
+module.exports = {
+  database,
+  getCharacter,
+  saveCharacter,
+  deleteCharacter,
+  getTrainingClass,
+  setTrainingClass,
+  listLoadouts,
+  getLoadout,
+  saveLoadout,
+  deleteLoadout,
+};

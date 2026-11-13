@@ -1,0 +1,594 @@
+-- Domain module. Generated from the old single-purpose Lua modules.
+local ROOT=assert(os.getenv('DARKERLAB_ROOT'),'DARKERLAB_ROOT is not set')
+local MOD=_G.__DARKERLAB_MOD_DIR or (ROOT..'/game/'..(os.getenv('DARKERLAB_GAME_COPY') or 'Dark and Darker-NoAC')..'/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/scripts/')
+local function loadDomain(name)
+ local cache=_G.__DARKERLAB_DOMAIN_CACHE or {};_G.__DARKERLAB_DOMAIN_CACHE=cache
+ if not cache[name] then cache[name]=dofile(MOD..name..'.lua') end
+ return cache[name]
+end
+local Core=loadDomain('core')
+local Mailbox=loadDomain('panel_runtime')
+local function make_ItemVariant()
+-- Build ItemData values from original PAK pools. The original inventory hook
+-- transfers the two arrays into the live ItemData before its native add runs.
+local V={}
+
+function V.generate(id,row,inventory,slot,base,pools,api)
+ assert(type(id)=='string'and id:match('^Id_Item_[%w_]+$'),'Invalid PAK item variant ID')
+ assert(type(row)=='table'and type(row.path)=='string'and row.path~='','PAK item variant path missing')
+ assert(inventory==2 or inventory==3,'Unsupported original inventory')
+ assert(type(slot)=='number','Original inventory slot missing')
+ assert(type(base)=='table'and type(base.ItemId)=='table','Original ItemData template missing for '..id)
+ assert(type(pools)=='table'and type(api)=='table'and type(api.makeAssetId)=='function'and type(api.randomInt)=='function','Original property-pool adapter incomplete')
+ local data={};for k,v in pairs(base)do data[k]=v end
+ data.ItemId=api.makeAssetId('ItemData',id);data.ItemUniqueId=0;data.InventoryId=inventory;data.SlotId=slot;data.ItemCount=1;data.bEquipped=inventory==3
+ data.ItemDataPrimaryPropertyArray={};data.ItemDataSecondaryPropertyArray={}
+ local function property(entry)
+  assert(type(entry)=='table'and type(entry.id)=='string'and entry.id:match('^Id_ItemPropertyType_[%w_]+$'),'Invalid original property type')
+  local lo=assert(tonumber(entry.minimum),'Original property minimum missing');local hi=assert(tonumber(entry.maximum),'Original property maximum missing');assert(lo<=hi,'Invalid original property bounds')
+  return{PropertyTypeId=api.makeAssetId('DesignDataItemPropertyType',entry.id),PropertyValue=api.randomInt(lo,hi),EnchantSourceItemId=api.makeAssetId('None','None')}
+ end
+ for _,entry in ipairs(assert(api.primaryEntries(row.primary_property_id),'Original primary property asset unavailable'))do data.ItemDataPrimaryPropertyArray[#data.ItemDataPrimaryPropertyArray+1]=property(entry)end
+ local slots=tonumber(row.secondary_pool_count)or 0;assert(slots==#(row.secondary_pool_ids or{}),'PAK secondary slot count mismatch')
+ local selected={}
+ for _,poolId in ipairs(row.secondary_pool_ids or{})do
+  local pool=assert(pools[poolId],'Original PAK property pool missing: '..poolId);local candidates={}
+  for _,entry in ipairs(pool.entries or{})do
+   local typeId=tostring(entry.property_type_reference or''):match('(Id_ItemPropertyType_[%w_]+)')
+   if typeId then candidates[#candidates+1]={id=typeId,minimum=entry.property.minimum_raw,maximum=entry.property.maximum_raw}end
+  end
+  local available={};for _,candidate in ipairs(candidates)do if not selected[candidate.id]then available[#available+1]=candidate end end
+  assert(#available>0,'No unused original affix candidates in pool '..poolId)
+  local chosen=available[api.randomInt(1,#available)];selected[chosen.id]=true
+  data.ItemDataSecondaryPropertyArray[#data.ItemDataSecondaryPropertyArray+1]=property(chosen)
+ end
+ assert(#data.ItemDataPrimaryPropertyArray>0,'Original primary property array is empty for '..id)
+ assert(#data.ItemDataSecondaryPropertyArray==slots,'Original affix count does not match PAK rarity slots')
+ return data,{itemId=id,rarity=row.rarity or'',primaryCount=#data.ItemDataPrimaryPropertyArray,secondaryCount=#data.ItemDataSecondaryPropertyArray,poolSlots=slots}
+end
+
+return V
+
+end
+local ItemVariant=make_ItemVariant()
+local function make_Inventory()
+local ROOT=assert(os.getenv('DARKERLAB_ROOT'),'DARKERLAB_ROOT is not set')
+local BUILD=assert(os.getenv('DARKERLAB_GAME_BUILD'),'DARKERLAB_GAME_BUILD is not set')
+-- Complete records produced by original GetItemData; original inventory validates adds.
+local I={}
+local function resolveGameRoot()
+  local explicit=os.getenv('DARKERLAB_GAME_PATH')
+  if explicit and explicit~='' then return (explicit:gsub('\\','/'):gsub('/+$','')) end
+  return ROOT..'/game/'..(os.getenv('DARKERLAB_GAME_COPY') or 'Dark and Darker-NoAC')
+end
+local GAME_ROOT=_G.__DARKERLAB_GAME_ROOT or resolveGameRoot()
+_G.__DARKERLAB_GAME_ROOT=GAME_ROOT
+local MOD=GAME_ROOT..'/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/'
+local catalogOk,catalog=pcall(dofile,ROOT..'/src/build/cache/catalog/profiles/'..BUILD..'/ui-data.lua')
+assert(catalogOk and catalog and catalog.items,'Current PAK item catalog unavailable')
+local Variant=ItemVariant
+local S=_G.__DARKERLAB_NATIVE_ITEMS or {seq=0,templates={},names={}}
+_G.__DARKERLAB_NATIVE_ITEMS=S
+local function valid(v)local ok,r=pcall(function()return v and v:IsValid()end);return ok and r==true end
+local function unwrap(v)local ok,r=pcall(function()return v:get()end);return ok and r or v end
+local function inventory(p,id)
+ for i=1,#p.InventoryComponentV2.InventoryList do local v=unwrap(p.InventoryComponentV2.InventoryList[i]);if valid(v)and v.InventoryId==id then return v end end
+ error('Original inventory missing: '..id)
+end
+local function api()return StaticFindObject('/Script/DungeonCrawler.Default__DCDataBlueprintLibrary'),StaticFindObject('/Script/DungeonCrawler.DCDataBlueprintLibrary:GetItemData')end
+-- Keep value records across worlds, never UE struct/array/string wrappers.
+local function copyValue(prop,v)
+ local kind=prop:GetClass():GetFName():ToString()
+ if kind=='StructProperty'then
+  local result={};prop:GetStruct():ForEachProperty(function(p)local n=p:GetFName():ToString();result[n]=copyValue(p,v[n])end);return result
+ elseif kind=='ArrayProperty'then
+  local result={};local inner=prop:GetInner();for i=1,#v do result[i]=copyValue(inner,unwrap(v[i]))end;return result
+ elseif kind=='NameProperty'then return require('UEHelpers').FindOrAddFName(v:ToString())
+ elseif kind=='StrProperty'then return type(v)=='string'and v or v:ToString()
+ elseif kind=='ObjectProperty'then assert(not valid(v),'Unexpected UObject in retained ItemData');return nil
+ elseif kind=='SoftObjectProperty'then
+  -- Shipped default kits have no SoulHeart skin reference. Resolve nonempty
+  -- references before extending this copier to arbitrary dropped items.
+  return nil
+ elseif type(v)=='number'or type(v)=='boolean'or type(v)=='string'then return v
+ end
+ error('Unsupported retained item field '..prop:GetFName():ToString()..' '..kind)
+end
+local function copyData(source)
+ local d={};StaticFindObject('/Script/DungeonCrawler.ItemData'):ForEachProperty(function(prop)local n=prop:GetFName():ToString();d[n]=copyValue(prop,source[n])end);return d
+end
+local function encode(s)return (s:gsub('[%%\t\r\n]',function(c)return string.format('%%%02X',string.byte(c))end))end
+local function decode(s)return (s:gsub('%%(%x%x)',function(h)return string.char(tonumber(h,16))end))end
+local function flatten(value,path,lines)
+ if type(value)=='table'then
+  lines[#lines+1]=path..'\tt\t'
+  local keys={};for k in pairs(value)do keys[#keys+1]=k end;table.sort(keys,function(a,b)return tostring(a)<tostring(b)end)
+  for _,k in ipairs(keys)do flatten(value[k],path..'/'..tostring(k),lines)end
+ elseif type(value)=='number'then lines[#lines+1]=path..'\tn\t'..string.format('%.17g',value)
+ elseif type(value)=='boolean'then lines[#lines+1]=path..'\tb\t'..(value and '1'or '0')
+ elseif type(value)=='string'then lines[#lines+1]=path..'\ts\t'..encode(value)
+ else lines[#lines+1]=path..'\tf\t'..encode(value:ToString())end
+end
+local function save()
+ local lines={'DARKERLAB_ITEM_CATALOG_V1\t'..BUILD,'seq\tn\t'..tostring(S.seq)}
+ flatten(S.templates,'items',lines)
+ local f=assert(io.open(MOD..'item-catalog.tmp','wb'));f:write(table.concat(lines,'\n')..'\n');f:close()
+ os.remove(MOD..'item-catalog.tsv');assert(os.rename(MOD..'item-catalog.tmp',MOD..'item-catalog.tsv'))
+end
+local function restore()
+ local f=io.open(MOD..'item-catalog.tsv','rb');if not f then return end
+ if f:read('*l')~='DARKERLAB_ITEM_CATALOG_V1\t'..BUILD then f:close();print('[NATIVE-ITEM] ignored catalog for other build');return end
+ local root={};local count=0
+ local ok,e=pcall(function()
+  for line in f:lines()do
+   count=count+1;assert(count<=100000,'Catalog exceeds bound')
+   local path,kind,data=line:match('^([^\t]+)\t([tnbsf])\t(.*)$');assert(path,'Malformed catalog record')
+   local value
+   if kind=='t'then value={}elseif kind=='n'then value=assert(tonumber(data))elseif kind=='b'then value=data=='1'
+   elseif kind=='s'then value=decode(data)else value=require('UEHelpers').FindOrAddFName(decode(data))end
+   local parts={};for part in path:gmatch('[^/]+')do parts[#parts+1]=tonumber(part)or part end
+   assert(#parts>0 and #parts<=16,'Invalid catalog path')
+   local parent=root;for i=1,#parts-1 do parent=assert(parent[parts[i]],'Missing catalog parent')end;parent[parts[#parts]]=value
+  end
+  assert(type(root.items)=='table'and type(root.seq)=='number','Incomplete catalog')
+  S.templates=root.items;S.seq=math.max(S.seq,root.seq)
+ end);f:close()
+ if not ok then print('[NATIVE-ITEM] catalog rejected: '..tostring(e))end
+end
+if S.version~=2 then S.templates={};S.names={};S.version=2 end
+if not S.diskLoaded then restore();S.diskLoaded=true end
+function I.capture(p)
+ assert(valid(p)and p.AbilitySystemComponent.bGASInitilized,'Original player not initialized')
+ local lib,get=api();local current={}
+ local infos=p.EquipmentComponentV2:GetEquippedItemInfos()
+ for i=1,#infos do local info=unwrap(infos[i]);local data=get(lib,info);local name=data.ItemId.PrimaryAssetName:ToString()
+  local captured=copyData(data);local retained=S.templates[name]
+  -- A failed insertion must never erase the last native property-bearing kit.
+  local function propertyCount(d)return d and (#d.ItemDataPrimaryPropertyArray+#d.ItemDataSecondaryPropertyArray)or 0 end
+  if not retained or propertyCount(captured)>=propertyCount(retained)then S.templates[name]=captured
+  else print('[NATIVE-ITEM] retained richer original properties for '..name)end
+  if captured.InventoryId==3 then
+   local row=catalog.items[name]
+   if row and row.slot_type and row.slot_type~=''then S.slotByType=S.slotByType or{};S.slotByType[row.slot_type]=captured.SlotId end
+  end
+  current[#current+1]=name
+ end
+ S.names={};for name in pairs(S.templates)do S.names[#S.names+1]=name end;table.sort(S.names)
+ save()
+ return S.names,current
+end
+function I.names()return S.names end
+local function variantFamily(name)return tostring(name):gsub('_[1-8]001$','')end
+function I.generateData(name,inventoryId,slot)
+ local row=assert(catalog.items[name],'Selected item variant missing from current PAK cache: '..tostring(name))
+ local lib=StaticFindObject('/Script/DungeonCrawler.Default__DCDataBlueprintLibrary')
+ local make=StaticFindObject('/Script/DungeonCrawler.DCDataBlueprintLibrary:MakePrimaryAssetId')
+ assert(valid(lib)and valid(make),'Original primary-asset ID constructor unavailable')
+ local function makeId(assetType,assetName)local value=make(lib,assetType..':'..assetName);assert(value and value.PrimaryAssetName,'Original primary-asset ID construction failed: '..assetType..':'..assetName);return value end
+ local function primaryEntries(propertyId)
+  if not propertyId or propertyId==''then return nil end
+  local pool=catalog.property_pools[propertyId]
+  if type(pool)=='table'and type(pool.entries)=='table'then
+   local result={}
+   for _,entry in ipairs(pool.entries)do
+    local p=entry.property or{};local id=tostring(entry.property_type_reference or''):match('(Id_ItemPropertyType_[%w_]+)')
+    if not id then local short=tostring(p.property_id or'');if short~=''then id='Id_ItemPropertyType_'..short end end
+    assert(id,'Invalid catalog primary property type: '..propertyId)
+    local lo=tonumber(p.minimum_raw);local hi=tonumber(p.maximum_raw)
+    assert(lo and hi and lo<=hi,'Invalid catalog primary property bounds: '..propertyId)
+    result[#result+1]={id=id,minimum=lo,maximum=hi}
+   end
+   assert(#result>0,'Catalog primary property array is empty: '..propertyId)
+   return result
+  end
+  local getProperty=StaticFindObject('/Script/DungeonCrawler.DCDataBlueprintLibrary:GetDesignDataItemProperty')
+  assert(valid(getProperty),'Original property lookup function unavailable; regenerate catalog with primary property pools')
+  local pid=makeId('DesignDataItemProperty',propertyId)
+  local asset=getProperty(lib,pid)
+  assert(type(asset)=='table'and type(asset.ItemPropertyItemArray)=='table','Original primary property data failed to load: '..propertyId)
+  local result={};local rows=asset.ItemPropertyItemArray
+  for i=1,#rows do local source=unwrap(rows[i]);local typeId=source.PropertyTypeId;result[#result+1]={id=typeId.PrimaryAssetName:ToString(),minimum=source.MinValue,maximum=source.MaxValue}end
+  return result
+ end
+ local base=S.templates[name]
+ if not base then local family=variantFamily(name);for templateName,record in pairs(S.templates)do if variantFamily(templateName)==family then base=record;break end end end
+ if not base then base=next(S.templates)and S.templates[next(S.templates)]end
+ assert(base,'No captured original ItemData template; initialize the original inventory first')
+ local data,evidence=Variant.generate(name,row,inventoryId,slot,base,catalog.property_pools,{
+  makeAssetId=makeId,
+  primaryEntries=primaryEntries,
+  randomInt=function(minimum,maximum)return math.random(minimum,maximum)end,
+ })
+ print(string.format('[NATIVE-ITEM] generated original design-data instance id=%s rarity=%s primary=%d secondary=%d',name,tostring(row.rarity),evidence.primaryCount,evidence.secondaryCount))
+ return data,row,evidence
+end
+local USER=ROOT..'/user/'
+local userEnsured=false
+local function ensureUser()
+ if userEnsured then return end
+ userEnsured=true
+ local native=USER:gsub('/','\\');os.execute('if not exist "'..native..'" mkdir "'..native..'" >nul 2>nul')
+end
+local function loadoutClass(p)
+ local class=tonumber(p.CharacterKey.CharacterClass)
+ assert(class and class>=1 and class<=10,'Original class not initialized')
+ return class
+end
+local function urlEncode(value)
+ return tostring(value or''):gsub('([^%w%-_%.~])',function(ch)return string.format('%%%02X',string.byte(ch))end)
+end
+local presetCache={}
+local presetPending={}
+local recordCache={}
+local apiLoadoutRecords
+local function parseLoadouts(class,body)
+ local rows={}
+ for line in body:gmatch('[^\r\n]+')do
+  local name,count,auto=line:match('^([^\t]*)\t(%d+)\t([01])$')
+  if name then rows[#rows+1]={class=class,name=name,count=tonumber(count),auto=auto=='1'} end
+ end
+ return rows
+end
+local function apiLoadouts(class,wait)
+ if not class then return {} end
+ local now=os.time();local cached=presetCache[class]
+ if cached and (cached.ok or now-cached.at<30) then return cached.rows end
+ local path='/api/loadouts?class='..tostring(class)
+ local function request()
+  if presetPending[class] then return end
+  presetPending[class]=true
+  Mailbox.submit('GET',path,'',function(status,body)
+   presetPending[class]=nil
+   if status==200 then
+    local rows=parseLoadouts(class,body)
+    presetCache[class]={at=os.time(),rows=rows,ok=true}
+    for _,row in ipairs(rows)do apiLoadoutRecords(class,row.name,false)end
+   else
+    presetCache[class]={at=os.time(),rows={},ok=false}
+   end
+  end)
+ end
+ request()
+ if wait then
+  Mailbox.wait(0.3,function()return presetCache[class]~=nil end)
+  local result=presetCache[class]
+  return result and result.rows or {}
+ end
+ return cached and cached.rows or {}
+end
+local recordPending={}
+apiLoadoutRecords=function(class,name,wait)
+ local key=tostring(class)..':'..tostring(name)
+ if recordCache[key]~=nil then return recordCache[key] end
+ local path='/api/loadouts/one?class='..tostring(class)..'&name='..urlEncode(name)
+ if not recordPending[key] and recordCache[key]==nil then
+  recordPending[key]=true
+  Mailbox.submit('GET',path,'',function(status,body)
+   recordPending[key]=nil
+   if status==200 then recordCache[key]=body end
+  end)
+ end
+ if wait then
+  Mailbox.wait(0.3,function()return recordCache[key]~=nil end)
+  return recordCache[key]
+ end
+ return nil
+end
+local function apiSaveLoadout(class,name,auto,records,count)
+ local path='/api/loadouts/save?class='..tostring(class)..'&name='..urlEncode(name)..'&auto='..(auto and'1'or'0')..'&count='..tostring(count)
+ local cached=presetCache[class]
+ if cached and cached.ok then
+  local row
+  for _,candidate in ipairs(cached.rows)do if candidate.name==name then row=candidate;break end end
+  if not row then row={class=class,name=name};cached.rows[#cached.rows+1]=row end
+  row.count=tonumber(count) or row.count;row.auto=auto and true or false
+  table.sort(cached.rows,function(a,b)if a.auto~=b.auto then return a.auto==true end;return a.name<b.name end)
+  cached.at=os.time()
+ else
+  presetCache[class]=nil
+ end
+ recordCache[tostring(class)..':'..tostring(name)]=nil
+ Mailbox.submit('POST',path,records,function(status,body)
+  if status~=200 then presetCache[class]=nil;print('[NATIVE-LOADOUT] async save failed: '..tostring(body))end
+ end)
+end
+local function loadLoadoutContent(p,text)
+ local class=loadoutClass(p)
+ local lines={}
+ for line in text:gmatch('[^\r\n]+')do lines[#lines+1]=line end
+ local root={};local count=0
+ local ok,e=pcall(function()
+  assert(lines[1]=='DARKERLAB_LOADOUT_V1\t'..BUILD..'\t'..class,'Loadout build/class mismatch')
+  for i=2,#lines do
+   local line=lines[i];count=count+1;assert(count<=100000,'Loadout exceeds bound')
+   local path,kind,data=line:match('^([^\t]+)\t([tnbsf])\t(.*)$');assert(path,'Malformed loadout')
+   local value
+   if kind=='t'then value={}elseif kind=='n'then value=assert(tonumber(data))elseif kind=='b'then assert(data=='0'or data=='1','Invalid boolean');value=data=='1'
+   elseif kind=='s'then value=decode(data)else value=require('UEHelpers').FindOrAddFName(decode(data))end
+   local parts={};for part in path:gmatch('[^/]+')do parts[#parts+1]=tonumber(part)or part end
+   assert(#parts>0 and #parts<=16 and parts[1]=='records','Invalid loadout path')
+   local parent=root;for j=1,#parts-1 do parent=assert(parent[parts[j]],'Missing loadout parent')end;parent[parts[#parts]]=value
+  end
+  assert(type(root.records)=='table'and #root.records>0 and #root.records<=100,'Invalid loadout count')
+  local ids,slots={},{}
+  for _,d in ipairs(root.records)do
+   assert((d.InventoryId==2 or d.InventoryId==3)and type(d.SlotId)=='number'and d.SlotId>=0,'Invalid original inventory/slot')
+   assert(type(d.ItemUniqueId)=='number'and not ids[d.ItemUniqueId],'Invalid duplicate item ID');ids[d.ItemUniqueId]=true
+   local slot=d.InventoryId..':'..d.SlotId;assert(not slots[slot],'Duplicate original slot');slots[slot]=true
+   assert(d.ItemId and d.ItemId.PrimaryAssetName and type(d.ItemDataPrimaryPropertyArray)=='table'and type(d.ItemDataSecondaryPropertyArray)=='table'and type(d.PermittedAreas)=='table','Incomplete original record')
+  end
+ end);assert(ok,e)
+ return root.records,class
+end
+function I.saveLoadout(p)
+ local class=loadoutClass(p)
+ local records=I.snapshot(p)
+ assert(#records>0,'Refusing an empty loadout')
+ local lines={'DARKERLAB_LOADOUT_V1\t'..BUILD..'\t'..class};flatten(records,'records',lines)
+ apiSaveLoadout(class,'__auto__',true,table.concat(lines,'\n'),#records)
+ return #records,class
+end
+function I.loadLoadout(p)
+ local class=loadoutClass(p)
+ for _,row in ipairs(apiLoadouts(class,true))do
+  if row.auto then
+   local text=apiLoadoutRecords(class,row.name,true)
+   if text then return loadLoadoutContent(p,text) end
+  end
+ end
+ return nil
+end
+function I.savePreset(p,name)
+ local class=loadoutClass(p)
+ name=tostring(name or''):gsub('[|\t\r\n]',' '):gsub('^%s+',''):gsub('%s+$','')
+ assert(name~='','Preset name is empty');name=name:sub(1,64)
+ local records={}
+ for _,record in ipairs(I.snapshot(p))do if record.InventoryId==3 and (tonumber(record.SlotId) or 99)<14 then records[#records+1]=record end end
+ assert(#records>0,'No equipped items to save')
+ local lines={'DARKERLAB_LOADOUT_V1\t'..BUILD..'\t'..class};flatten(records,'records',lines)
+ apiSaveLoadout(class,name,false,table.concat(lines,'\n'),#records)
+ print('[NATIVE-LOADOUT] saved server preset class='..class..' name='..name..' records='..#records)
+ return #records,class,name
+end
+function I.listPresets(p)
+ local class=loadoutClass(p);local result={}
+ for _,row in ipairs(apiLoadouts(class,true))do if not row.auto then result[#result+1]={id=row.name,name=row.name,count=row.count} end end
+ return result,class
+end
+function I.presetNames(class)
+ local names={}
+ if class then for _,row in ipairs(apiLoadouts(class))do if not row.auto then names[#names+1]=row.name end end end
+ return names
+end
+function I.loadPreset(p,name)
+ local class=loadoutClass(p)
+ local text=apiLoadoutRecords(class,name,true)
+ if not text then return nil,'Preset not found: '..tostring(name) end
+ local records,fileClass=loadLoadoutContent(p,text)
+ return records,class,name,fileClass
+end
+local function liveEquipped(p,slot)
+ local inv=inventory(p,3);if not inv then return nil end
+ local lib,get=api();local found
+ inv.Values:ForEach(function(_,raw)local v=unwrap(raw);local d=get(lib,v);if d.SlotId==slot then found={value=v,data=d} end end)
+ return found
+end
+local function refreshEquipment(p)
+ pcall(function()p.EquipmentComponentV2:OnRep_EquipArmorInfo()end)
+ pcall(function()p.EquipmentComponentV2:OnRep_EquipHoldInfo()end)
+ pcall(function()p.EquipmentComponentV2:OnRep_EquipAnimData()end)
+end
+local viewSlotByActual={[10]=0,[11]=1,[1]=2,[2]=3,[3]=4,[4]=5,[5]=6,[6]=7,[8]=8,[9]=9,[12]=10,[13]=11}
+local function writeEquipmentView(p)
+ local out={'DARKERLAB_EQUIPMENT_V2'}
+ for _,d in ipairs(I.snapshot(p))do
+  local actual=tonumber(d.SlotId);local display=actual and viewSlotByActual[actual]
+  if d.InventoryId==3 and display then
+   local id=d.ItemId.PrimaryAssetName:ToString();local row=catalog.items[id]
+   local name=row and row.name or id;local rarity=row and row.rarity or''
+   out[#out+1]=display..'\t'..id..'\t'..name..'\t'..rarity
+  end
+ end
+ Mailbox.publishModel('panel-equipment.tsv',table.concat(out,'\n')..'\n')
+end
+local applyProperties,insert
+local function addRecord(p,record)
+ local d=copyData(record);S.seq=S.seq+1;d.ItemUniqueId=2026102200000+S.seq
+ assert(insert(p,d),'Rebuild inventory rejected record')
+end
+local function rebuildFor(p,dropSlots,newRecords)
+ local before=I.snapshot(p)
+ local ok,e=pcall(function()p.InventoryComponentV2:ClearInventoryItems()end)
+ assert(ok,'ClearInventoryItems failed: '..tostring(e))
+ for _,record in ipairs(before)do
+  local slot=tonumber(record.SlotId)
+  local drop=record.InventoryId==3 and slot and dropSlots[slot]
+  if not drop then addRecord(p,record) end
+ end
+ for _,record in ipairs(newRecords)do addRecord(p,record)end
+end
+function I.applyPreset(p,name)
+ local records,class=I.loadPreset(p,name);assert(records,'Preset not found: '..tostring(name))
+ local drop={};for i=0,13 do drop[i]=true end
+ rebuildFor(p,drop,records)
+ local applied=#records
+ save();refreshEquipment(p);I.capture(p);writeEquipmentView(p)
+ print('[NATIVE-LOADOUT] applied preset class='..class..' name='..name..' records='..applied)
+ return applied,class
+end
+-- Retain native value records, then let the original inventory rebuild its
+-- actors, modifiers and equipment notifications. Never synthesize effects.
+function I.snapshot(p)
+ local lib,get=api();local records={}
+ for i=1,#p.InventoryComponentV2.InventoryList do local inv=unwrap(p.InventoryComponentV2.InventoryList[i])
+  assert(valid(inv)and(inv.InventoryId==2 or inv.InventoryId==3),'Unexpected owned inventory')
+  inv.Values:ForEach(function(_,raw)local d=copyData(get(lib,unwrap(raw)));records[#records+1]=d end)
+ end
+ table.sort(records,function(a,b)if a.InventoryId~=b.InventoryId then return a.InventoryId>b.InventoryId end;return a.SlotId<b.SlotId end)
+ return records
+end
+local function sameValue(a,b)
+ if type(a)~=type(b)then return false end
+ if type(a)=='table'then
+  for k,v in pairs(a)do if not sameValue(v,b[k])then return false end end
+  for k in pairs(b)do if a[k]==nil then return false end end
+  return true
+ elseif type(a)=='userdata'then return a:ToString()==b:ToString()end
+ return a==b
+end
+-- UE4SS's nested table marshaller drops whole TArrays in this build.
+-- Write each element into the real ItemData from the original add hook.
+local ARRAY_FIELDS={'ItemDataPrimaryPropertyArray','ItemDataSecondaryPropertyArray','PermittedAreas'}
+local function writeArray(target,field,source)
+ local array=target[field]
+ assert(array,'ItemData array missing: '..field)
+ for i,v in ipairs(source)do
+  if field=='PermittedAreas'then
+   array[i]=v
+  else
+   array[i]={PropertyTypeId=v.PropertyTypeId,PropertyValue=v.PropertyValue,EnchantSourceItemId=v.EnchantSourceItemId}
+  end
+ end
+end
+applyProperties=function(target,source)
+ target.Tradable=source.Tradable
+ target.bEquipped=source.bEquipped
+ for _,field in ipairs(ARRAY_FIELDS)do writeArray(target,field,source[field])end
+end
+insert=function(p,d)
+ assert(not S.pendingInsert,'Nested training insertion')
+ if not S.arrayHook then
+  S.arrayHook={RegisterHook('/Script/DungeonCrawler.DCInventoryComponent:AddItemDataToInventory',function(context,inv,param)
+   local pending=S.pendingInsert;if not pending then return end
+   if context:get():GetAddress()~=pending.owner then return end
+   local target=param:get();if target.ItemUniqueId~=pending.data.ItemUniqueId then return end
+   local ok,e=pcall(applyProperties,target,pending.data);pending.repaired=ok;pending.error=e
+  end)}
+ end
+ local request={owner=p.InventoryComponentV2:GetAddress(),data=d};S.pendingInsert=request
+ local outgoing=copyData(d);for _,n in ipairs(ARRAY_FIELDS)do outgoing[n]={}end
+ local ok,accepted=pcall(function()return p.InventoryComponentV2:AddItemDataToInventory(d.InventoryId,outgoing)end)
+ S.pendingInsert=nil
+ assert(ok and accepted and request.repaired,'Original insertion failed: '..tostring(request.error or accepted))
+ return accepted
+end
+local function matches(p,records)
+ local actual={};local count=0;local lib,get=api()
+ for i=1,#p.InventoryComponentV2.InventoryList do local inv=unwrap(p.InventoryComponentV2.InventoryList[i])
+  inv.Values:ForEach(function(_,raw)local d=copyData(get(lib,unwrap(raw)));actual[d.ItemUniqueId]=d;count=count+1 end)
+ end
+ if count~=#records then return false end
+ for _,d in ipairs(records)do if not sameValue(actual[d.ItemUniqueId],d)then return false end end
+ return true
+end
+function I.matches(p,records)return matches(p,records)end
+function I.restore(p,records)
+ assert(valid(p)and p.AbilitySystemComponent.bGASInitilized and not p.bIsDead,'Player not ready for original inventory restore')
+ local bag=inventory(p,2)
+ local existing={}
+ bag.Values:ForEach(function(_,raw)local v=unwrap(raw);existing[v.ItemUniqueId]=true end)
+ local added=0
+ for _,record in ipairs(records)do
+  if not existing[record.ItemUniqueId]then
+   local d=copyData(record)
+   S.seq=S.seq+1;d.ItemUniqueId=2026102200000+S.seq
+   d.InventoryId=2;d.SlotId=-1;d.bEquipped=false
+   assert(insert(p,d),'Original bag rejected restored item: '..record.ItemId.PrimaryAssetName:ToString())
+   added=added+1
+  end
+ end
+ if added>0 then save()end
+ return added>0
+end
+function I.equipSlot(p,name,slot)
+ I.capture(p)
+ local d,row=I.generateData(name,3,slot)
+ local actualSlot=slot
+ local byType={['Type.Item.Slot.Primary']=10,['Type.Item.Slot.Secondary']=11,['Type.Item.Slot.Head']=1,['Type.Item.Slot.Chest']=2,['Type.Item.Slot.Hands']=3,['Type.Item.Slot.Legs']=4,['Type.Item.Slot.Foot']=5,['Type.Item.Slot.Necklace']=6,['Type.Item.Slot.Back']=8,['Type.Item.Slot.Sash']=9,['Type.Item.Slot.Ring']=12}
+ if row and row.slot_type and byType[row.slot_type] then actualSlot=byType[row.slot_type] end
+ if row and row.slot_type and S.slotByType and S.slotByType[row.slot_type] then actualSlot=S.slotByType[row.slot_type] end
+ d=copyData(d);S.seq=S.seq+1;local id=2026102200000+S.seq
+ d.ItemUniqueId=id;d.InventoryId=3;d.SlotId=actualSlot;d.bEquipped=true
+ local inserted=pcall(insert,p,d)
+ if not inserted then
+  local drop={[actualSlot]=true}
+  rebuildFor(p,drop,{d})
+  save();refreshEquipment(p);I.capture(p);writeEquipmentView(p)
+  print(string.format('[NATIVE-ITEM] rebuilt equipped item id=%s slot=%d',name,actualSlot))
+  return id,actualSlot
+ end
+ I.capture(p);writeEquipmentView(p)
+ print(string.format('[NATIVE-ITEM] equipped original item id=%s slot=%d',name,actualSlot))
+ return id,actualSlot
+end
+function I.equip(p,name)
+ local id=I.add(p,name)
+ print(string.format('[NATIVE-ITEM] added to bag; equip manually id=%s',name))
+ return id,-1
+end
+function I.equipEmpty(p,name)
+ return I.add(p,name)
+end
+function I.add(p,name)
+ I.capture(p)
+ local d,row=I.generateData(name,2,-1)
+ local bag=inventory(p,2)
+ d=copyData(d)
+ S.seq=S.seq+1;local id=2026102200000+S.seq
+ save()
+ d.ItemUniqueId=id;d.InventoryId=2;d.SlotId=-1;d.bEquipped=false
+ assert(insert(p,d),'Original bag rejected item (space or class restrictions)')
+ local found=false;local lib,get=api();bag.Values:ForEach(function(_,raw)local v=unwrap(raw);if v.ID._==id then
+  assert(valid(v.DataAsset),'Original item data missing');local actual=copyData(get(lib,v))
+  local actualName='';pcall(function()actualName=actual.ItemId.PrimaryAssetName:ToString()end)
+  assert(actual.ItemUniqueId==id and actual.InventoryId==2,'Inserted bag record identity differs')
+  assert(actualName==name,'Inserted bag record item ID differs: '..actualName..' / '..name)
+  assert(#actual.ItemDataPrimaryPropertyArray==#d.ItemDataPrimaryPropertyArray,'Inserted bag primary properties differ')
+  assert(#actual.ItemDataSecondaryPropertyArray==#d.ItemDataSecondaryPropertyArray,'Inserted bag secondary properties differ')
+  found=true
+ end end)
+ assert(found,'Original insertion returned without matching inventory state')
+ print(string.format('[NATIVE-ITEM] original rarity variant added id=%s rarity=%s primary=%d secondary=%d',name,tostring(row.rarity),#d.ItemDataPrimaryPropertyArray,#d.ItemDataSecondaryPropertyArray))
+ return id
+end
+function I.infinite(p)
+ if S.infiniteDisabled then return end
+ local now=os.time();if S.infiniteNextAt and now<S.infiniteNextAt then return end;S.infiniteNextAt=now+3
+ if S.infiniteBusy then return end
+ S.infiniteBusy=true
+ S.infiniteCounts=S.infiniteCounts or{}
+ S.infiniteWhere=S.infiniteWhere or{}
+ local ok,e=pcall(function()
+  local lib,get=api()
+  local seen={}
+  for i=1,#p.InventoryComponentV2.InventoryList do
+   local inv=unwrap(p.InventoryComponentV2.InventoryList[i])
+   if valid(inv) and (inv.InventoryId==2 or inv.InventoryId==3) then
+    inv.Values:ForEach(function(_,raw)
+     local v=raw:get();local d=get(lib,v);local n=d.ItemId.PrimaryAssetName:ToString();seen[n]=true
+     S.infiniteWhere[n]=d.InventoryId
+     local c=tonumber(v.Stack) or tonumber(d.ItemCount) or 0
+     local b=S.infiniteCounts[n]
+     if not b or c>b then S.infiniteCounts[n]=c
+     elseif c<b then
+      local written,why=pcall(function() v.Stack=b end)
+      if not written then print('[NATIVE-ITEM] stack write failed '..n..': '..tostring(why)) end
+     end
+    end)
+   end
+  end
+  for n,_ in pairs(S.infiniteCounts) do
+   if not seen[n] and S.templates[n] then
+    local added,why=pcall(I.add,p,n)
+    if not added then S.infiniteDisabled=true;S.infiniteStackables=false;print('[NATIVE-ITEM] automatic refill disabled after first failure '..n..': '..tostring(why));break end
+   end
+  end
+ end)
+ S.infiniteBusy=false
+ if not ok then print('[NATIVE-ITEM] infinite audit failed: '..tostring(e)) end
+end
+return I
+
+end
+local Inventory=make_Inventory()
+return {item_variant=ItemVariant, inventory=Inventory}

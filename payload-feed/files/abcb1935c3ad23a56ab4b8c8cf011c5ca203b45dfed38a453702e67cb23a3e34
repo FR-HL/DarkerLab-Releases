@@ -1,0 +1,178 @@
+"use strict";
+const http = require("http");
+
+function createHttpLobby({ log, classProfiles, profiles, projectRoot, tcpPort, httpPort }) {
+  const controlToken = process.env.DARKERLAB_CONTROL_TOKEN || "";
+  const sendText = (res, status, text) => {
+    res.writeHead(status, { "Content-Type": "text/plain; charset=utf-8", "X-DarkerLab-Api": "2" });
+    res.end(text);
+  };
+
+  const sendJson = (res, status, payload) => {
+    res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "X-DarkerLab-Api": "2" });
+    res.end(JSON.stringify(payload));
+  };
+
+  const getTraining = (character) => classProfiles.trainingClass(projectRoot, character);
+  const getLoadout = (classIndex, name, character) => classProfiles.getLoadout(projectRoot, classIndex, name, character);
+  const listLoadouts = (classIndex, character) => classProfiles.listLoadouts(projectRoot, classIndex, character);
+
+  const handleApiV2 = (res, url, method, body) => {
+    try {
+      const params = url.searchParams;
+      if (url.pathname === "/api/v2/profile/class" && method === "GET") {
+        return sendJson(res, 200, { api: 2, ok: true, data: getTraining(params.get("character") || "1") });
+      }
+      if (url.pathname === "/api/v2/profile/class" && method === "POST") {
+        return sendJson(res, 200, { api: 2, ok: true, data: classProfiles.setTrainingClass(projectRoot, Number(params.get("index")), params.get("character") || "1") });
+      }
+      if (url.pathname === "/api/v2/loadouts" && method === "GET") {
+        return sendJson(res, 200, { api: 2, ok: true, data: listLoadouts(Number(params.get("class")), params.get("character") || "1") });
+      }
+      if (url.pathname === "/api/v2/loadouts/one" && method === "GET") {
+        const row = getLoadout(Number(params.get("class")), params.get("name") || "", params.get("character") || "1");
+        if (!row) return sendJson(res, 404, { api: 2, ok: false, error: "not found" });
+        return sendJson(res, 200, { api: 2, ok: true, data: row });
+      }
+      if (url.pathname === "/api/v2/loadouts/save" && method === "POST") {
+        const row = classProfiles.saveLoadout(projectRoot, {
+          classIndex: Number(params.get("class")), name: params.get("name") || "",
+          auto: params.get("auto") === "1", count: Number(params.get("count")) || 1, records: body,
+          characterId: params.get("character") || "1",
+        });
+        return sendJson(res, 200, { api: 2, ok: true, data: row });
+      }
+      if (url.pathname === "/api/v2/loadouts/delete" && method === "POST") {
+        const removed = classProfiles.deleteLoadout(projectRoot, Number(params.get("class")), params.get("name") || "", params.get("character") || "1");
+        return sendJson(res, removed ? 200 : 404, removed ? { api: 2, ok: true } : { api: 2, ok: false, error: "not found" });
+      }
+      return sendJson(res, 404, { api: 2, ok: false, error: "not found" });
+    } catch (error) {
+      log("HTTP API v2 error " + error.message);
+      return sendJson(res, 500, { api: 2, ok: false, error: error.message });
+    }
+  };
+
+  const handleApi = (res, url, method, body) => {
+    try {
+      const params = url.searchParams;
+      if (url.pathname === "/api/profile/class" && method === "GET") {
+        const state = classProfiles.trainingClass(projectRoot);
+        return sendText(res, 200, state.index + "\n" + state.name + "\n");
+      }
+      if (url.pathname === "/api/profile/class" && method === "POST") {
+        const state = classProfiles.setTrainingClass(projectRoot, Number(params.get("index")));
+        return sendText(res, 200, state.index + "\n" + state.name + "\n");
+      }
+      if (url.pathname === "/api/loadouts" && method === "GET") {
+        const rows = classProfiles.listLoadouts(projectRoot, Number(params.get("class")));
+        const lines = rows.map((row) => [row.name, row.count, row.auto ? 1 : 0].join("\t"));
+        return sendText(res, 200, lines.length ? lines.join("\n") + "\n" : "");
+      }
+      if (url.pathname === "/api/loadouts/one" && method === "GET") {
+        const row = classProfiles.getLoadout(projectRoot, Number(params.get("class")), params.get("name") || "");
+        if (!row) return sendText(res, 404, "not found\n");
+        return sendText(res, 200, row.records);
+      }
+      if (url.pathname === "/api/loadouts/save" && method === "POST") {
+        classProfiles.saveLoadout(projectRoot, {
+          classIndex: Number(params.get("class")),
+          name: params.get("name") || "",
+          auto: params.get("auto") === "1",
+          count: Number(params.get("count")) || 1,
+          records: body,
+        });
+        return sendText(res, 200, "ok\n");
+      }
+      if (url.pathname === "/api/loadouts/delete" && method === "POST") {
+        const removed = classProfiles.deleteLoadout(projectRoot, Number(params.get("class")), params.get("name") || "");
+        return sendText(res, removed ? 200 : 404, removed ? "ok\n" : "not found\n");
+      }
+      return sendText(res, 404, "not found\n");
+    } catch (error) {
+      log("HTTP API error " + error.message);
+      return sendText(res, 500, error.message + "\n");
+    }
+  };
+
+  const hs = http.createServer((req, res) => {
+    log(`HTTP ${req.method} ${req.url}`);
+    let body = "";
+    req.on("data", (c) => { if (body.length < 8 * 1024 * 1024) body += c; });
+    req.on("end", () => {
+      if (body) log(`HTTP body=${body.slice(0, 200)}`);
+      const url = new URL(req.url, "http://127.0.0.1");
+      if (url.pathname.startsWith("/api/")) {
+        if (req.headers["x-darkerlab-api"] && req.headers["x-darkerlab-api"] !== "2") return sendText(res, 400, "unsupported api version\n");
+        if (controlToken && req.headers["x-darkerlab-token"] !== controlToken) return sendText(res, 401, "unauthorized\n");
+        if (url.pathname.startsWith("/api/v2/")) { handleApiV2(res, url, req.method, body); return; }
+        handleApi(res, url, req.method, body); return;
+      }
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      let out;
+      const q = url.pathname;
+      if (q === "/GameStartServer") {
+        out = {
+          restUrl: "http://127.0.0.1:30000", gameId: 1, maxGameUser: 1, waitTimeSec: 0,
+          dungeonMapIds: ["/Game/DungeonCrawler/Maps/Dungeon/Layouts/Arena/Arena_Crypt_Vault_P", "/Game/DungeonCrawler/Maps/Dungeon/Layouts/Arena/Arena_Crypt_GuardPost_P"], gameHackPolicy: 0,
+          validPlayerMeleeAttackRange: 0, gameType: 3, shippingLogOnOffPolicy: 0, shippingLogLevelPolicy: 0,
+          gmOnOffPolicy: 0, shippingLogIronShieldOnOffPolicy: 0, shippingLogIronShieldLevelPolicy: 0,
+          currentFloor: 1, continuousMatchOnOff: 0, matchmakingType: 0, region: "1", fleetId: "1",
+          dungeonIdTag: "Id_Dungeon_RandomCrypt_N_Solo", cloudScanUrl: "", serverLocate: 0,
+          matchingQueueType: 0, baseCampRemovedPolicy: 0, numReservedUsers: 0,
+          reservedUserWaitTimeoutSec: 0, dungeonJoinTimeSec: 0, finishBufferTimeSec: 0,
+          spawnSearchRadiusPlayer: 0, spawnSearchRadiusMonster: 0, easyPoolType: 0,
+          escapeFailAdventurePointOnOff: 0, gearScoreIndex: 0, dungeonGrade: 0, rankPointRatio: 0,
+          s3HackInfo: { s3BasePath: "" }, basecampId: 0, sessionKind: 0, basecampDeadlineSec: 0,
+          dungeonLayoutDisclosureEnabled: "false", initialActorAdmissionEnabled: "false",
+          basecampDepartureCountdownSec: 0
+        };
+      } else if (q === "/GameEnterUser") {
+        const className = classProfiles.selectedClass(projectRoot);
+        out = {
+          restUrl: "http://127.0.0.1:30000", nickName: "OfflinePlayer", streamingNickName: "",
+          characterClass: `DesignDataPlayerCharacter:Id_PlayerCharacter_${className}`, characterId: "1",
+          gender: 0, level: 1, partyId: "1", karmaRating: 0, reservedPartyMember: [],
+          isRandomJoin: 0, findRandomTeam: 0
+        };
+        log(`GameEnterUser class=${className}`);
+      } else if (q === "/GameCharacterInfo") {
+        const className = classProfiles.selectedClass(projectRoot);
+        const selectedProfile = profiles[className];
+        out = { info: {
+          gameId: 1, accountId: "1", characterId: "1", items: [], ...classProfiles.gameCharacterOptions(selectedProfile),
+          characterSkinIds: [], itemSkinIds: [], emotes: [], actionIds: [],
+          quests: [], entranceFee: 0, seasonId: "", isSeason: 0, armorSkinIds: [], totalPlayTimeSec: 0,
+          level: 1, fame: 0, isBlackList: 0, gearScore: 0, religionSeasonId: "", religionId: "",
+          blessingLv: 0, chatBlockMin: 0, mmr: 0, deathPenalty: 0, affinities: [],
+          shapeShiftSkinIds: [], monsterSummonSkinIds: [], anteGold: 0, anteGearScoreCarried: 0,
+          anteLossEstimate: 0
+        } };
+        log(`GameCharacterInfo class=${className} perks=${selectedProfile.options.perks.length} skills=${selectedProfile.options.skills.length} spells=${selectedProfile.options.spells.length} musics=${selectedProfile.options.musics.length} shapeShifts=${selectedProfile.options.shapeShifts.length}`);
+      } else if (q === "/GamePolicy") { out = { appHash: [], policyJson: "{}" }; }
+      else if (q === "/GameFileDB") { out = { fileDBJson: "{}" }; }
+      else if (q === "/GameAliveCheck") { out = { Id: "1", Us: [] }; }
+      else if (q === "/GameDown/UserParty") { out = { partyMember: [] }; }
+      else if (q === "/DungeonFloorRuleBlizzard") { out = { infos: [] }; }
+      else if (q === "/DungeonFloorRuleDeathSwarm") { out = { infos: [] }; }
+      else if (q === "/GameSpectator/Check") { out = { isSuccess: 1 }; }
+      else if (q.startsWith("/news")) {
+        out = { result: 0, resultCode: 0, totalCount: 0, list: [], articles: [], data: [] };
+      } else {
+        out = { ipAddress: "127.0.0.1", port: tcpPort };
+      }
+      if (out && out.__txt) {
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        res.end(out.__txt);
+      } else {
+        res.end(JSON.stringify(out));
+      }
+    });
+  });
+  hs.on("error", (e) => { log("http err " + e.message); process.exit(1); });
+  hs.listen(httpPort, "127.0.0.1", () => log("HTTP READY"));
+  return hs;
+}
+
+module.exports = { createHttpLobby };

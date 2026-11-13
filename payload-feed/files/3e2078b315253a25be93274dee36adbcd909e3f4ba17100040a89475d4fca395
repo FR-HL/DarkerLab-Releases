@@ -1,0 +1,39 @@
+-- Production startup: fix the local login state, then enter the original lobby.
+-- Character selection has its own protocol/UI path; training no longer starts
+-- in the arena automatically.
+local started = os.clock()
+local fixed = false
+local switched = false
+LoopAsync(250, function()
+  local ok, err = pcall(function()
+    if not fixed then
+      local objs = FindAllOf("LoginWidget")
+      if objs then for _, o in ipairs(objs) do
+        local okv, v = pcall(function() return o.LoginState end)
+        if okv and v == 2 then
+          pcall(function() o.LoginState = 17 end)
+          P("login fix 2->17")
+          fixed = true
+        end
+      end end
+    end
+    if fixed and not switched and (os.clock() - started) > 5 then
+      local pc = FindFirstOf("PlayerController")
+      local inLogin = false
+      pcall(function()
+        local w = FindFirstOf("World")
+        if w then inLogin = tostring(w:GetFullName()):find("Login", 1, true) ~= nil end
+      end)
+      if pc ~= nil and inLogin then
+        local okSwitch, result = pcall(function()
+          pc:SwitchLevel("/Game/DungeonCrawler/Maps/Lobby_P?Name=Player?AccountId=1")
+        end)
+        P("lobby switch: " .. tostring(okSwitch) .. " " .. tostring(result))
+        switched = true
+      end
+    end
+  end)
+  if not ok then P("loop err: " .. tostring(err)) end
+  return switched or (ok and (os.clock() - started) > 60)
+end)
+P("TrainingCamp v3 loaded")

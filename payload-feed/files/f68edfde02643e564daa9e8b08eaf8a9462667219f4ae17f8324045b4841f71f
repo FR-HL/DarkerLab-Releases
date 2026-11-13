@@ -1,0 +1,81 @@
+-- TrainingCamp owns one Lua state: keep callbacks and Unreal access on its game thread.
+-- Pinned UE4SS 8333063595fa3c49ad307f3b0f732accbb760d25 provides this timer API.
+local existing=rawget(_G,'__DARKERLAB_SCHEDULER')
+if existing then return existing end
+assert(type(LoopInGameThreadWithDelay)=='function','Game-thread timer API unavailable')
+assert(type(CancelDelayedAction)=='function' and type(IsInGameThread)=='function','Game-thread timer lifecycle API unavailable')
+local originalDispatch=ExecuteInGameThread
+local Q={active={},created=0,completed=0,failed=0}
+function Q.dispatch(fn)
+ assert(type(fn)=='function','Expected callback')
+ if IsInGameThread() then return fn() end
+ return originalDispatch(fn)
+end
+function Q.cancel(handle)
+ if not Q.active[handle] then return false end
+ Q.active[handle]=nil
+ if tickers[handle] then tickers[handle].active=false;tickers[handle]=nil;return true end
+ return CancelDelayedAction(handle)
+end
+-- Hook-based ticker: survives map load (LoopInGameThreadWithDelay handles
+-- are invalidated when the world changes, which stopped the panel after loadMap).
+local tickers={}
+local tickHook=nil
+local lastTick=os.clock()
+local function pumpTickers()
+ local ok,err=pcall(function()
+  local now=os.clock();local dt=now-lastTick;lastTick=now
+  if dt<=0 or dt>1 then dt=0.016 end
+  for handle,state in pairs(tickers)do
+   if state.active then
+    state.acc=state.acc+dt
+    if state.acc>=state.delay then
+     state.acc=state.acc-state.delay
+     if state.acc>state.delay then state.acc=0 end
+     local ok2,finished=pcall(state.fn)
+     if not ok2 then
+      Q.failed=Q.failed+1
+      print('[TRAINING-SCHEDULER] stopped timer '..tostring(handle)..': '..tostring(finished))
+      state.active=false;tickers[handle]=nil
+     elseif finished==true then
+      Q.completed=Q.completed+1
+      state.active=false;tickers[handle]=nil
+     end
+    end
+   else
+    tickers[handle]=nil
+   end
+  end
+ end)
+ if not ok then print('[TRAINING-SCHEDULER] pump error: '..tostring(err)) end
+end
+local function ensureHook()
+ if tickHook then return true end
+ local ok,hook=pcall(RegisterHook,'/Script/Engine.Engine:Tick',function() pumpTickers() end)
+ if ok and hook then tickHook=hook;return true end
+ return false
+end
+function Q.loop(delay,fn)
+ assert(type(delay)=='number' and delay>=1 and type(fn)=='function','Invalid training timer')
+ local handle={}
+ tickers[handle]={fn=fn,delay=delay/1000,acc=0,active=true}
+ Q.active[handle]=true;Q.created=Q.created+1
+ if not ensureHook() then
+  -- fallback to original API if hook registration fails
+  local h2
+  h2=LoopInGameThreadWithDelay(delay,function()
+   if not Q.active[h2] then return end
+   local ok,finished=pcall(fn)
+   if not ok or finished==true then Q.active[h2]=nil end
+  end)
+  Q.active[h2]=true
+  return h2
+ end
+ return handle
+end
+-- This mod has its own Lua environment. Existing probes use these same entrypoints.
+_G.__DARKERLAB_SCHEDULER=Q
+_G.LoopAsync=Q.loop
+_G.ExecuteInGameThread=Q.dispatch
+print('[TRAINING-SCHEDULER] game-thread timers installed; async Lua callbacks disabled')
+return Q

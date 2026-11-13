@@ -1,0 +1,76 @@
+local ROOT=assert(os.getenv('DARKERLAB_ROOT'),'DARKERLAB_ROOT is not set')
+-- ============================================================
+-- DarkerLab TrainingCamp v3（全能版）
+-- 生产启动入口：只保留登录、进入 Vault 和面板加载。
+-- 诊断/控制台探针不进入正式包。
+-- ============================================================
+local function resolveGameRoot()
+  local explicit=os.getenv('DARKERLAB_GAME_PATH')
+  if explicit and explicit~='' then return (explicit:gsub('\\','/'):gsub('/+$','')) end
+  return ROOT..'/game/'..(os.getenv('DARKERLAB_GAME_COPY') or 'Dark and Darker-NoAC')
+end
+local GAME_ROOT=resolveGameRoot()
+_G.__DARKERLAB_GAME_ROOT=GAME_ROOT
+local MOD_DIR = GAME_ROOT.."/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/"
+_G.__DARKERLAB_MOD_DIR = MOD_DIR .. "scripts/"
+local Scheduler = dofile(MOD_DIR .. "scripts/scheduler.lua")
+local LoopAsync = Scheduler.loop
+local ExecuteInGameThread = Scheduler.dispatch
+local GM = "?game=/Game/DungeonCrawler/Core/Game/BP_GameModeTutorial.BP_GameModeTutorial_C"
+
+local ROOMS = {
+  { "Crypt_Vault",        "/Game/DungeonCrawler/Maps/Dungeon/Layouts/Arena/Arena_Crypt_Vault_P" },
+  { "Crypt_GuardPost",    "/Game/DungeonCrawler/Maps/Dungeon/Layouts/Arena/Arena_Crypt_GuardPost_P" },
+  { "Crypt_TreasureRoom", "/Game/DungeonCrawler/Maps/Dungeon/Layouts/Arena/Arena_Crypt_TreasureRoom_P" },
+  { "IceCavern_Bridge",   "/Game/DungeonCrawler/Maps/Dungeon/Layouts/Arena/Arena_IceCavern_Bridge_P" },
+  { "IceCavern_CaveSwamp","/Game/DungeonCrawler/Maps/Dungeon/Layouts/Arena/Arena_IceCavern_CaveSwamp_P" },
+  { "GoblinCave_PitHall", "/Game/DungeonCrawler/Maps/Dungeon/Layouts/Arena/Arena_GoblinCave_PitHall_P" },
+  { "GoblinCave_StoneGrave","/Game/DungeonCrawler/Maps/Dungeon/Layouts/Arena/Arena_GoblinCave_StoneGrave_P" },
+  { "GoblinCave_BanditCamp","/Game/DungeonCrawler/Maps/Dungeon/Layouts/Arena/Arena_GoblinCave_BanditCamp_P" },
+  { "Inferno_Obelisk",    "/Game/DungeonCrawler/Maps/Dungeon/Layouts/Arena/Arena_Inferno_Obelisk_P" },
+  { "Inferno_Doomcage",   "/Game/DungeonCrawler/Maps/Dungeon/Layouts/Arena/Arena_Inferno_Doomcage_P" },
+  { "Ruins_Square_01",    "/Game/DungeonCrawler/Maps/Dungeon/Layouts/Arena/Arena_Ruins_Square_01_P" },
+  { "Ruins_UndergroundAltar","/Game/DungeonCrawler/Maps/Dungeon/Layouts/Arena/Arena_Ruins_UndergroundAltar_P" },
+  { "Ruins_Tower_01_Destroyed","/Game/DungeonCrawler/Maps/Dungeon/Layouts/Arena/Arena_Ruins_Tower_01_Destroyed_P" },
+  { "Abyss_DividingHill", "/Game/DungeonCrawler/Maps/Dungeon/Layouts/Arena/Arena_Abyss_DividingHill_P" },
+}
+
+local function now() return os.date("%H:%M:%S") end
+local function P(s) print("[CAMP] " .. s) end
+_G.__AI_PAUSED = true
+
+-- ---------- 基础动作 ----------
+local function loadMapPath(path)
+  _G.__LAST_MAP = string.match(path, "([^/]+)$")
+  ExecuteInGameThread(function()
+    pcall(function()
+      local pc = FindFirstOf("PlayerController")
+      if pc ~= nil then
+        local extra = ""; if _G.__LISTEN then extra = "?listen" end
+        if _G.__LISTEN then
+          local gs2 = StaticFindObject("/Script/Engine.GameplayStatics")
+          local ok2, w2 = pcall(function() local pc2 = FindFirstOf("PlayerController") return pc2 and pc2.Pawn and pc2.Pawn:GetWorld() end)
+          local okw2, ww2 = pcall(function() return FindFirstOf("World") end)
+          local ctx = (ok2 and w2) or (okw2 and ww2) or pc
+          P("openlevel listen ctx=" .. tostring(ctx))
+          pcall(function() gs2:OpenLevel(ctx, path .. "?Name=Player?AccountId=1" .. GM .. extra, true, "Name=Player?AccountId=1") end)
+        else
+          pc:SwitchLevel(path .. "?Name=Player?AccountId=1" .. GM .. extra)
+        end
+        P("loadMap " .. path)
+      end
+    end)
+  end)
+end
+
+local function loadRoom(idx)
+  local r = ROOMS[idx]
+  if r == nil then P("no room " .. tostring(idx)); return end
+  loadMapPath(r[2])
+end
+
+-- Production startup only: login fix, direct Vault entry, and panel.
+_G.P=P; _G.ROOMS=ROOMS; _G.loadRoom=loadRoom; _G.LoopAsync=LoopAsync; _G.ExecuteInGameThread=ExecuteInGameThread
+dofile(MOD_DIR.."scripts/main_bootstrap.lua")
+local panelOK, panelError = pcall(dofile, MOD_DIR .. "scripts/panel.lua")
+if not panelOK then P("native training panel load error: " .. tostring(panelError)) end

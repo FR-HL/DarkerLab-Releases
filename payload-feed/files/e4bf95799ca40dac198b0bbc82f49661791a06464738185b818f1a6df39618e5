@@ -1,0 +1,6 @@
+"use strict";
+// The protobuf module is generated from the client descriptor set and is a
+// durable runtime artifact, not a disposable build cache entry.
+const path = require("node:path");
+const root = process.env.DARKERLAB_ROOT || path.resolve(__dirname, "../../..");
+module.exports = require(path.join(root, "src", "app", "server", "generated", "proto_generated.js"));

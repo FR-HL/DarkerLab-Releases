@@ -1,0 +1,6 @@
+-- GENERATED from src/build/config/game-build-profiles.json by build.ps1.
+-- Do not hand-edit this file.
+return {
+  gui = "gui.dll",
+  core = "training_core.dll",
+}

@@ -1,0 +1,12 @@
+-- Domain module. Generated from the old single-purpose Lua modules.
+local ROOT=assert(os.getenv('DARKERLAB_ROOT'),'DARKERLAB_ROOT is not set')
+local MOD=_G.__DARKERLAB_MOD_DIR or (ROOT..'/game/'..(os.getenv('DARKERLAB_GAME_COPY') or 'Dark and Darker-NoAC')..'/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/scripts/')
+local function loadDomain(name)
+ local cache=_G.__DARKERLAB_DOMAIN_CACHE or {};_G.__DARKERLAB_DOMAIN_CACHE=cache
+ if not cache[name] then cache[name]=dofile(MOD..name..'.lua') end
+ return cache[name]
+end
+local Core=loadDomain('core')
+local InventoryDomain=loadDomain('player_inventory')
+local CharacterDomain=loadDomain('player_character')
+return {classes=CharacterDomain.classes, inventory=InventoryDomain.inventory, item_variant=InventoryDomain.item_variant, attributes=CharacterDomain.attributes, guard=CharacterDomain.guard, ability_recovery=CharacterDomain.ability_recovery, character_reset=CharacterDomain.character_reset}

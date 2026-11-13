@@ -1,0 +1,127 @@
+-- Panel recovery actions, loaded by panel.lua with its live state/dependencies.
+return function(env)
+ local S,player,valid,health,log=env.S,env.player,env.valid,env.health,env.log
+ local Scheduler,AbilityRecovery=env.Scheduler,env.AbilityRecovery
+ local function autoHeal()
+   local _,p=player();if not p then return end
+   local hp,max=health(p);if not max then return end
+   if S.actionUntil and os.time()<S.actionUntil then return end
+   if hp>=max then S.action='Auto heal: health already full';return end
+   local name=require('UEHelpers').FindOrAddFName
+   local lib=StaticFindObject('/Script/DungeonCrawler.Default__DCAbilitySystemBlueprintLibrary')
+   local apply=StaticFindObject('/Script/DungeonCrawler.DCAbilitySystemBlueprintLibrary:ApplyGameplayEffectByIds')
+   local returned=apply(lib,p,{{PrimaryAssetType={Name=name('DesignDataGameplayEffect')},PrimaryAssetName=name('Id_MonsterEffect_Lib_Heal_50')}},p)
+   S.action='Auto heal: applied original 50 heal effect; handles='..#returned
+ end
+ local function attackBlockedNow()
+  local _,p=player();if not p then return false end
+  local lib=StaticFindObject('/Script/DungeonCrawler.Default__DCAbilitySystemBlueprintLibrary')
+  local getTags=StaticFindObject('/Script/DungeonCrawler.DCAbilitySystemBlueprintLibrary:GetOwnedGameplayTags')
+  if not(valid(lib)and valid(getTags))then return false end
+  local out={};getTags(lib,p,out)
+  for _,rawTag in ipairs(out.GameplayTags or{})do
+   local tag=rawTag;local ok,value=pcall(function()return rawTag:get()end);if ok then tag=value end
+   local name=tag.TagName:ToString()
+   if name=='LocalState.Character.Act.Attack.Disabled.Both'or name=='LocalState.Character.Act.Attack.Disabled.Primary'then return true end
+  end
+  return false
+ end
+ local function recoverAttack(auto)
+  if S.recoveryLock then if not auto then S.action='Attack recovery already running; wait for the current request' end;return end
+  S.recoveryLock=true
+  Scheduler.loop(1500,function()S.recoveryLock=false;return true end)
+  local _,p=player();assert(p,'No dungeon player')
+  local lib=StaticFindObject('/Script/DungeonCrawler.Default__DCAbilitySystemBlueprintLibrary')
+  local getTags=StaticFindObject('/Script/DungeonCrawler.DCAbilitySystemBlueprintLibrary:GetOwnedGameplayTags')
+  assert(valid(lib)and valid(getTags),'Original gameplay-tag query unavailable')
+  local function attackBlocked()
+   local out={};getTags(lib,p,out)
+   for _,rawTag in ipairs(out.GameplayTags or{})do
+    local tag=rawTag;local ok,value=pcall(function()return rawTag:get()end);if ok then tag=value end
+    local name=tag.TagName:ToString()
+    if name=='LocalState.Character.Act.Attack.Disabled.Both'or name=='LocalState.Character.Act.Attack.Disabled.Primary'then return true end
+   end
+   return false
+  end
+  local blocked=attackBlocked()
+  if auto and not S.autoRecover and not blocked then
+   S.recoveryLock=false
+   return
+  end
+  local cancel=StaticFindObject('/Script/GameplayAbilities.GameplayAbility:K2_CancelAbility')
+  assert(valid(cancel),'Original ability-cancel entrypoint unavailable')
+  local endAbility=StaticFindObject('/Script/GameplayAbilities.GameplayAbility:K2_EndAbility')
+  local endLocally=StaticFindObject('/Script/GameplayAbilities.GameplayAbility:K2_EndAbilityLocally')
+  local apply=StaticFindObject('/Script/DungeonCrawler.DCAbilitySystemBlueprintLibrary:ApplyGameplayEffectByIds')
+  local name=require('UEHelpers').FindOrAddFName
+  assert(valid(apply),'Original cooldown effect application unavailable')
+  local has=StaticFindObject('/Script/DungeonCrawler.DCAbilitySystemBlueprintLibrary:HasMatchingGameplayTag')
+  assert(valid(has),'Original cooldown tag query unavailable')
+  local function applyCooldown(instance)
+   local got,data=pcall(function()return instance:GetCurrentDesignDataSkill()end)
+   if not got then return false end
+   local effect=AbilityRecovery.cooldownAsset(data)
+   if not effect then return false end
+   if has(lib,p,data.SkillCooldownTag)then return true end
+   local ok,result=pcall(function()return apply(lib,p,{effect},p)end)
+   if not ok or type(result)~='table'or #result==0 then return false end
+   local validHandle=false
+   for i=1,#result do
+    local h=result[i];local unwrapped,value=pcall(function()return h:get()end);if unwrapped then h=value end
+    if type(h.Handle)=='number'and h.Handle>0 then validHandle=true end
+   end
+   if not validHandle or not has(lib,p,data.SkillCooldownTag)then return false end
+   log('Applied original cooldown effect '..effect.PrimaryAssetName:ToString())
+   return true
+  end
+  S.abilityRecoveryClock=(S.abilityRecoveryClock or 0)+0.25
+  S.abilityRecoverySeen=S.abilityRecoverySeen or {}
+  local result=AbilityRecovery.recover(p.AbilitySystemComponent.ActivatableAbilities.Items,blocked,{
+   valid=valid,
+   name=function(o)return o and o:GetFullName()or''end,
+   identity=function(o)return o:GetAddress()end,
+   cooldown=applyCooldown,
+   stale=function(instance,abilityName)
+    -- F12 is an explicit recovery request. Only the background sweep waits to
+    -- distinguish a genuinely stale ability from a short normal transition.
+    if not auto then return true end
+    local id=tostring(instance:GetAddress())
+    local row=S.abilityRecoverySeen[id]
+    if not row then row={first=S.abilityRecoveryClock};S.abilityRecoverySeen[id]=row end
+    row.last=S.abilityRecoveryClock
+    local montage=instance.GetCurrentMontage and instance:GetCurrentMontage() or nil
+    if valid(montage) then row.first=S.abilityRecoveryClock;return false end
+    return S.abilityRecoveryClock-row.first>=2.0
+   end,
+   finish=function(instance,spec)
+    -- Prefer the original natural end; K2_EndAbility may be authority-gated.
+    -- Only count it when ActiveCount really reaches zero; otherwise cancel.
+    if valid(endAbility)then
+     local ok=pcall(function()return endAbility(instance)end)
+     if ok and (tonumber(spec.ActiveCount)or 0)==0 then return true end
+    end
+    if valid(endLocally)then
+     local ok=pcall(function()return endLocally(instance)end)
+     if ok and (tonumber(spec.ActiveCount)or 0)==0 then return true end
+    end
+    return false
+   end,
+   cancel=function(instance)return cancel(instance)end,
+  })
+  local stillBlocked=attackBlocked()
+  if auto then
+   if result.status=='recovered' then log('Automatic released ability recovery: cooldown_applied='..result.cooldownApplied..' ended='..(result.ended or 0)..' cancelled='..result.cancelled) end
+  elseif result.status=='recovered'and not stillBlocked then
+   S.action='Recovered attack input; cooldown applied '..result.cooldownApplied..'; ended '..(result.ended or 0)..'; cancelled '..result.cancelled..' stuck original ability instance(s); abilities retained'
+  elseif result.status=='recovered'then
+   S.action='Cooldown applied '..result.cooldownApplied..'; ended '..(result.ended or 0)..'; cancelled '..result.cancelled..' active ability instance(s); attack remains blocked by another original state'
+  elseif result.status=='not_blocked'then
+   S.action='Attack is not blocked by original gameplay tags; no ability cancelled'
+  else
+   S.action='No released active ability could be cancelled; cooldown_applied='..result.cooldownApplied..' cooldown_failed='..result.cooldownFailed..' failed='..result.failed..' '..tostring(result.lastError or'')
+  end
+  log(S.action)
+ end
+ 
+ return {autoHeal=autoHeal,recoverAttack=recoverAttack,attackBlocked=attackBlockedNow}
+end

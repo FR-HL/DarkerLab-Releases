@@ -1,0 +1,470 @@
+-- Private 10393 candidate for the observed original wheel -> cast-trigger gap.
+-- Install explicitly and tick on the existing game thread. No input, timeout,
+-- mesh/stat construction or charge refill. Original default preparation is opt-in.
+-- Adapted from the Miaoqu V8.5 source exchange package
+-- (engine-allboss/Scripts/NativeDruidShapeLifecycle.lua, 2026-11-12).
+local M={}
+local BASE='/Game/DungeonCrawler/Data/Generated/V2/'
+local DEFAULT='/Game/DungeonCrawler/Data/Generated/DT_PlayerCharacter/PlayerCharacter/Id_PlayerCharacter_Druid.Id_PlayerCharacter_Druid'
+local ORDER={'DefaultCharacter','Panther','Bear','Rat','Chicken'}
+local LEGACY_ORDER={'Bear','Chicken','DefaultCharacter','Panther','Penguin','Rat'}
+local allowed={DefaultCharacter=true,Panther=true,Bear=true,Rat=true,Chicken=true}
+local function read(fn)local ok,v=pcall(fn);if ok then return v end end
+local function valid(o)return read(function()return o and o:IsValid()end)==true end
+local function same(a,b)return valid(a)and valid(b)and a:GetAddress()==b:GetAddress()end
+local function str(v)return read(function()return v:ToString()end)or tostring(v)end
+local function tag(v)return read(function()return str(v.TagName)end)end
+local function unwrap(v)return read(function()return v:get()end)or v end
+local function each(a,limit,fn,name)
+ local count=a and #a
+ assert(count and count<=limit,'Native Druid array bound differs: '..tostring(name or'unnamed')..' count='..tostring(count)..' max='..limit)
+ for i=1,count do fn(unwrap(a[i]),i)end
+end
+local function shapePath(n)local id='Id_ShapeShift_'..n;return BASE..'ShapeShift/ShapeShift/'..id..'.'..id end
+local function rootPath(n)local id='Id_ShapeShiftAbility_'..(n=='DefaultCharacter'and'UnShapeShift'or n);return BASE..'ShapeShift/ShapeShiftAbility/'..id..'.'..id end
+local function copyHandle(h)h=unwrap(h);return{Handle=h.Handle,_owner=read(function()return h.WeakOwningASC:Get()end)or h._owner}end
+function M.install(options)
+ assert(type(options)=='table'and options.enabled==true and type(options.getContext)=='function','Explicit owned Druid context required')
+ local b={hooks={},started=0,triggered=0,applied=0,finished=0,skippedNative=0,errors=0,stopped=false,
+  memoryAttempts=0,memoryPrepared=0,memoryFailures=0,memoryPreserved=0,
+  memoryStatus=(options.prepareDefaultWhenReady==true or options.republishCurrentWhenReady==true or options.migrateLegacyToCurrentWhenReady==true)and'waiting_current_druid'or'disabled'}
+ local tickets,queue,record,memoryMemo,currentMemoryMemo={},{},nil,nil,nil
+ local prepareMemoryWhenReady,republishCurrentWhenReady,migrateLegacyToCurrentWhenReady
+ local function context()
+  local c=options.getContext();assert(c and valid(c.pawn)and valid(c.world),'Current Druid owner missing')
+  assert(c.pawn.CharacterKey.CharacterClass==9 and not c.pawn.bIsDead,'Current living Druid required')
+  assert(same(c.pawn:GetWorld(),c.world)and c.pawn:IsLocallyControlled()and c.pawn:GetLocalRole()==3 and not valid(c.world.NetDriver),'Current standalone authority Druid required')
+  local g=StaticFindObject('/Script/Engine.Default__GameplayStatics')
+  assert(valid(g)and same(g:GetPlayerPawn(c.world,0),c.pawn),'Current local Druid differs')
+  for _,field in ipairs({'AbilitySystemComponent','ShapeShiftComponent','ClassShapeShiftComponent','SkillComponent'})do assert(valid(c.pawn[field]),'Native Druid component missing: '..field)end
+  assert(same(c.pawn.ShapeShiftComponent:GetOwner(),c.pawn)and same(c.pawn.ClassShapeShiftComponent:GetOwner(),c.pawn),'Native Druid component owner differs')
+  return c
+ end
+ local function current(r,c)return r and r.world_id==c.world_id and same(r.pawn,c.pawn)and same(r.world,c.world)end
+ local function identity(c)return{pawn=c.pawn,world=c.world,world_id=c.world_id}end
+ local function instances(c,fn)
+  each(c.pawn.AbilitySystemComponent.ActivatableAbilities.Items,1024,function(spec)
+   for _,field in ipairs({'NonReplicatedInstances','ReplicatedInstances'})do each(spec[field],32,function(a)
+    if valid(a)and same(a:GetAvatarActorFromActorInfo(),c.pawn)and same(a:GetWorld(),c.world)then fn(a,spec)end
+   end)end
+  end)
+ end
+ local function ownedCast(c,a)
+  if not valid(a)or not a.bIsActive or a.bIsAbilityEnding or not a:IsA('/Script/DungeonCrawler.GA_PlayerShapeShiftCastBase')then return false end
+  local found=false;instances(c,function(v)if same(v,a)then found=true end end);return found
+ end
+ local function selected(a)
+  local asset=read(function()return a.CurrentShapeShiftDataAsset:Get()end)
+  local n=valid(asset)and tag(asset.ShapeShiftTag):match('^Ability%.ShapeShift%.([%w]+)$')
+  assert(n and allowed[n],'Original default Druid shape required');return asset,n
+ end
+ local function memorySlot(c)
+  local slot;each(c.pawn.SkillComponent.AccountSkillDatas,2,function(d,i)
+   if tag(d.SkillTag)=='Ability.Player.Skill.ShapeShiftMemory1'then assert(not slot,'Ambiguous original Druid memory');slot=i end
+  end);assert(slot,'Original ShapeShiftMemory1 must remain equipped');return slot
+ end
+ local function memoryContains(c,asset,n)
+  local found=false;each(c.pawn.ClassShapeShiftComponent.ShapeShiftDatas,10,function(d)
+   if str(d.ShapeShiftId.PrimaryAssetName)=='Id_ShapeShift_'..n and tag(d.ShapeShiftTag)==tag(asset.ShapeShiftTag)then found=true end
+  end);assert(found,'Cast shape is no longer in current original memory')
+ end
+ local function collision(c,asset)
+  local accepted=false;each(FindAllOf('GameShapeShiftSlotWidget')or{},128,function(w)
+   if valid(w)and same(w:GetOwningPlayerPawn(),c.pawn)and same(w:GetWorld(),c.world)and same(w.ShapeShiftDataAsset,asset)and w:IsShapeShiftCastable()==true then accepted=true end
+  end);assert(accepted,'Original shape collision test did not accept this form')
+ end
+ local function nativeHandle(c,h)
+  local result;each(c.pawn.AbilitySystemComponent:GetActiveEffects({}),4096,function(v)if v.Handle==h.Handle then result=v end end)
+  return result or{Handle=-1}
+ end
+ local function active(c)
+  local out={};each(c.pawn.AbilitySystemComponent:GetActiveEffects({EffectSource=c.pawn}),4096,function(h)out[h.Handle]=copyHandle(h)end);return out
+ end
+ local function nativeDefinition(path,lib,system)
+  local data=LoadAsset(path);assert(valid(data),'Original Druid ability asset missing: '..path)
+  lib:GetDCGameplayAbilityData(system:Conv_ObjectToSoftObjectReference(data),{})
+  local count,native=0;data.CachedDataMap:ForEach(function(_,p)count=count+1;native=p:get()end)
+  assert(count==1 and native and valid(native.GameplayAbilityClass),'Original Druid ability cache differs');return native
+ end
+ local function definition(n)
+  local asset=LoadAsset(shapePath(n));assert(valid(asset)and asset:IsA('/Script/DungeonCrawler.DCShapeShiftDataAsset')and tag(asset.ShapeShiftTag)=='Ability.ShapeShift.'..n,'Original Druid shape asset differs')
+  local druid=false;each(asset.Classes,8,function(id)if str(id.PrimaryAssetName)=='Id_PlayerCharacter_Druid'then druid=true end end);assert(druid,'Shape does not belong to original Druid')
+  local system=StaticFindObject('/Script/Engine.Default__KismetSystemLibrary')
+  assert(str(system:Conv_SoftObjectReferenceToString(asset.ShapeShiftingAbility))==rootPath(n),'Original transforming ability differs')
+  return asset,system
+ end
+ local function preflight(c,asset,n)
+  local loaded,system=definition(n);assert(same(asset,loaded),'Cast selected a different native form asset')
+  memorySlot(c);memoryContains(c,asset,n);collision(c,asset)
+  local component=c.pawn.ShapeShiftComponent
+  if not record then assert(not valid(component.Data)and not valid(component.AppliedData)and #component.AbilitySpecHandles==0 and #component.GameplayEffectHandles==0,'Existing or partial native form is not owned by this bridge')
+  else assert(current(record,c)and same(component.Data,record.asset)and same(component.AppliedData,record.asset),'Tracked native form no longer matches')end
+  assert(#c.pawn.SkillComponent.CurSkillDataList==2,'Native two-slot skill storage differs')
+  local lib=StaticFindObject('/Script/DungeonCrawler.Default__DCAbilitySystemBlueprintLibrary');assert(valid(lib)and valid(system),'Native ability libraries unavailable')
+  local result={asset=asset,n=n,lib=lib,root=nativeDefinition(rootPath(n),lib,system),extras={},skills={}}
+  assert(#asset.Abilities==(n=='DefaultCharacter'and 0 or 4)and #asset.Skills==(n=='DefaultCharacter'and 0 or 2),'Original default form layout differs')
+  each(asset.Abilities,8,function(ref)
+   local path=str(system:Conv_SoftObjectReferenceToString(ref));assert(path:find(BASE..'ShapeShift/ShapeShiftAbility/Id_ShapeShiftAbility_'..n,1,true)==1,'Foreign form ability reference')
+   result.extras[#result.extras+1]=nativeDefinition(path,lib,system)
+  end)
+  each(asset.Skills,2,function(ref)local path=str(system:Conv_SoftObjectReferenceToString(ref));assert(path:find(BASE..'Skill/Skill/Id_Skill_',1,true)==1,'Foreign form skill reference');local d=LoadAsset(path);assert(valid(d),'Original form skill missing');result.skills[#result.skills+1]=d end)
+  return result
+ end
+ local function refresh(c,skills)
+  local component=c.pawn.SkillComponent;local wanted={}
+  if skills then
+   local slot=memorySlot(c);wanted[slot]=component.AccountSkillDatas[slot]
+   for _,asset in ipairs(skills)do if tag(asset.SkillTag)~='Ability.Player.Skill.ShapeShiftMemory1'then
+    local other=3-slot;local t=tag(asset.SkillTag);wanted[other]={SkillTag=asset.SkillTag,CooldownTag=asset.SkillCooldownTag,EffectHandle={Handle=-1},RemainDuration=0,MaxDuration=0,StartTime=0}
+    -- This is the native history cache, not the current two HUD slots. Native
+    -- OnRep_Data retains Rush/InsectPredation/etc. after returning to human.
+    each(component.ShapeShiftSkillDatas,32,function(d)if tag(d.SkillTag)==t then wanted[other]=d end end,'SkillComponent.ShapeShiftSkillDatas')
+    each(component.SkillActors,8,function(a)if valid(a)and tag(a.SkillData.SkillTag)==t and a.SkillData.SlotIndex~=other-1 then local old=a:GetSkillData();a.SkillData.SlotIndex=other-1;a:OnRep_SkillData(old)end end,'SkillComponent.SkillActors')
+   end end
+  else each(component.AccountSkillDatas,2,function(d,i)wanted[i]=d end)end
+  assert(wanted[1]and wanted[2],'Original Druid skill pair missing')
+  local saved={};for i=1,2 do local d=wanted[i];saved[i]={s=d.SkillTag.TagName,c=d.CooldownTag.TagName,h=d.EffectHandle.Handle,r=d.RemainDuration,m=d.MaxDuration,t=d.StartTime}end
+  for i=1,2 do local d,v=component.CurSkillDataList[i],saved[i];d.SkillTag={TagName=v.s};d.CooldownTag={TagName=v.c};d.EffectHandle={Handle=v.h};d.RemainDuration=v.r;d.MaxDuration=v.m;d.StartTime=v.t end
+  component:OnRep_SkillDataList({})
+ end
+ local function removeOwn(c,r)
+  local asc=c.pawn.AbilitySystemComponent;local component=c.pawn.ShapeShiftComponent
+  for _,h in pairs(r.effects)do local native=nativeHandle(c,h);if native.Handle>=0 then asc:RemoveActiveGameplayEffect(native,-1)end end
+  if valid(r.running)and r.running.bIsActive and same(r.running:GetAvatarActorFromActorInfo(),c.pawn)then r.running:K2_EndAbility()end
+  for _,h in ipairs(r.grants)do asc:ClearAbility(h)end
+  local a,e={},{};each(component.AbilitySpecHandles,128,function(h)if not r.grantSet[h.Handle]then a[#a+1]={Handle=h.Handle}end end)
+  each(component.GameplayEffectHandles,128,function(h)if not r.effects[h.Handle]then e[#e+1]=copyHandle(h)end end)
+  component.AbilitySpecHandles:Empty();component.GameplayEffectHandles:Empty()
+  for i,h in ipairs(a)do component.AbilitySpecHandles[i]=h end;for i,h in ipairs(e)do component.GameplayEffectHandles[i]=nativeHandle(c,h)end
+  if same(component.Data,r.asset)then local old=component.Data;component.Data=nil;component:OnRep_Data(old);refresh(c,nil)end
+ end
+ local function rootSpecs(c,native)
+  local specs={};each(c.pawn.AbilitySystemComponent.ActivatableAbilities.Items,1024,function(s)
+   if valid(s.Ability)and same(s.Ability:GetClass(),native.GameplayAbilityClass)and same(s.SourceObject:Get(),c.pawn)then specs[#specs+1]=s end
+  end);assert(#specs<=1,'Ambiguous original transforming ability');return specs
+ end
+ local function countSnapshot(c)
+  local out={};each(c.pawn.SkillComponent.SkillActors,8,function(a)if valid(a)and tag(a.SkillData.SkillTag)=='Ability.Player.Skill.ShapeShiftMemory1'then out[#out+1]={count=a.SkillData.Count,charge=a.SkillData.ChargeAmount,actor=a:GetAddress()}end end,'SkillComponent.SkillActors')
+  out.cooldown=c.pawn.AbilitySystemComponent:GetGameplayTagCount({TagName=FName('State.Character.Skill.Cooldown.ShapeShiftMemory1')})
+  return out
+ end
+ local function complete(c,t)
+  local cast=t.cast;assert(ownedCast(c,cast),'Original triggered cast is no longer active')
+  local asset,n=selected(cast);assert(same(asset,t.asset),'Original triggered selection changed')
+  local component=c.pawn.ShapeShiftComponent
+  if not record and same(component.Data,asset)and same(component.AppliedData,asset)then b.skippedNative=b.skippedNative+1;b.lastStage='native_already_applied';return end
+  local d=preflight(c,asset,n)
+  b.countBefore=countSnapshot(c)
+  -- Match the previously tested completion order: retire this exact cast before
+  -- native OnRep_Data can replace its animation instance. Charge state is never
+  -- set here; Count/stack-cooldown parity remains a separate native QA criterion.
+  cast:K2_EndAbility();assert(not cast.bIsActive,'Original shape cast did not retire')
+  if record then local old=record;record=nil;removeOwn(c,old)end
+  if n=='DefaultCharacter'then refresh(c,nil);b.finished=b.finished+1;b.lastStage='restored_original_human';b.countAfter=countSnapshot(c);return end
+  local r=identity(c);r.asset=asset;r.grants={};r.grantSet={};r.effects={};r.before=active(c);record=r
+  local function grant(native)
+   local prior={};each(c.pawn.AbilitySystemComponent.ActivatableAbilities.Items,1024,function(s)prior[s.Handle.Handle]=s end)
+   local h=unwrap(d.lib:GiveAbility(c.pawn,c.pawn,native,false,true,{},asset));assert(h.Handle>=0,'Original Druid ability grant rejected')
+   if prior[h.Handle]then local s=prior[h.Handle];assert(valid(s.Ability)and same(s.Ability:GetClass(),native.GameplayAbilityClass)and same(s.SourceObject:Get(),c.pawn),'Native grant returned a foreign existing ability');return end
+   r.grants[#r.grants+1]={Handle=h.Handle};r.grantSet[h.Handle]=true
+  end
+  if #rootSpecs(c,d.root)==0 then grant(d.root)end
+  local old=component.Data;component.Data=asset;component:OnRep_Data(old);refresh(c,d.skills)
+  for _,native in ipairs(d.extras)do grant(native)end
+  local again=context();assert(current(r,again),'Druid owner changed during native completion')
+  local event={TagName=asset.ShapeShiftTag.TagName}
+  StaticFindObject('/Script/GameplayAbilities.Default__AbilitySystemBlueprintLibrary'):SendGameplayEventToActor(c.pawn,event,{EventTag=event,Instigator=c.pawn,Target=c.pawn,OptionalObject=asset})
+  local roots=rootSpecs(c,d.root);assert(#roots==1,'Original transforming ability unavailable after native event')
+  local running;for _,field in ipairs({'NonReplicatedInstances','ReplicatedInstances'})do each(roots[1][field],32,function(a)
+   if valid(a)and a.bIsActive and same(a:GetAvatarActorFromActorInfo(),c.pawn)and same(a:GetWorld(),c.world)then assert(not running or same(running,a),'Ambiguous native form instance');running=a end
+  end)end
+  assert(running,'Original form event did not activate its own ability');r.running=running
+  local stateTag=read(function()return running.ShapeShiftStateTag end)
+  local nativeApplied=tag(stateTag)=='State.ActorStatus.Buff.ShapeShift.Animal.'..n and c.pawn.AbilitySystemComponent:GetGameplayTagCount(stateTag)>0
+  local hs={};if not nativeApplied then hs=running:ApplyEffectContainer({TagName=FName('Event.ShapeShift.Activate')},{Instigator=c.pawn,Target=c.pawn},-1,1,true)end
+  for id,h in pairs(active(c))do if not r.before[id]then r.effects[id]=h end end
+  each(hs,128,function(h)if h.Handle>=0 then r.effects[h.Handle]=copyHandle(h)end end)
+  for _,h in ipairs(r.grants)do component.AbilitySpecHandles[#component.AbilitySpecHandles+1]=h end
+  for _,h in pairs(r.effects)do component.GameplayEffectHandles[#component.GameplayEffectHandles+1]=nativeHandle(c,h)end
+  assert(same(component.Data,asset)and same(component.AppliedData,asset),'Original model notification did not apply selected data')
+  b.applied=b.applied+1;b.lastShape=n;b.lastStage='applied_original_form';b.countAfter=countSnapshot(c)
+ end
+ local function observe(label,parameter)
+  if b.stopped then return end
+  local ok,c=pcall(context);if not ok then return end
+  local a=unwrap(parameter);if not valid(a)then return end;local key=a:GetAddress()
+  if label=='OnCancelled'or label=='OnInterrupted'or label=='OnCompleted'then tickets[key]=nil;queue[key]=nil;return end
+  if not ownedCast(c,a)then return end
+  if label=='OnStartSync'then
+   if current(tickets[key],c)then return end
+   local asset=selected(a);local t=identity(c);t.cast=a;t.asset=asset;t.serial=b.started+1;tickets[key]=t;b.started=b.started+1
+  else
+   local t=tickets[key];if not current(t,c)or t.queued then return end
+   local asset=selected(a);if not same(asset,t.asset)then return end
+   t.queued=true;queue[key]=t;b.triggered=b.triggered+1;b.lastStage='queued_original_cast_trigger'
+  end
+ end
+ for _,label in ipairs({'OnStartSync','OnCastTriggerSync','OnCancelled','OnInterrupted','OnCompleted'})do
+  local path='/Script/DungeonCrawler.GA_PlayerShapeShiftCastBase:'..label
+  local pre,post=RegisterHook(path,function()end,function(p)
+   local ok,err=pcall(observe,label,p);if not ok then b.lastObservation=tostring(err):gsub('[%z\r\n]',' '):sub(1,350)end
+  end);b.hooks[#b.hooks+1]={path,pre,post}
+ end
+ function b:tick()
+  if self.stopped or self.ticking then return false end;self.ticking=true
+  local ok,c=pcall(context);if not ok then self.lastContextError=tostring(c);tickets={};queue={};record=nil;if options.prepareDefaultWhenReady==true then self.memoryStatus='waiting_current_druid'end;self.ticking=false;return false end
+  if record and not current(record,c)then record=nil end
+  local good=true
+  for key,t in pairs(queue)do
+   queue[key]=nil;tickets[key]=nil
+   if current(t,c)then
+    local previous=record;local worked,err=pcall(complete,c,t)
+    if not worked then
+     good=false;self.errors=self.errors+1;self.lastStage='native_completion_failed';self.lastError=tostring(err):gsub('[%z\r\n]',' '):sub(1,500)
+     if record~=previous and current(record,c)then
+      local old=record;record=nil;local rolled,why=pcall(function()for id,h in pairs(active(c))do if not old.before[id]then old.effects[id]=h end end;removeOwn(c,old)end)
+      if not rolled then self.lastError=self.lastError..'; receipt rollback failed: '..tostring(why)end
+     end
+    end
+   end
+  end
+  if options.migrateLegacyToCurrentWhenReady==true then migrateLegacyToCurrentWhenReady(c)end
+  if options.republishCurrentWhenReady==true then republishCurrentWhenReady(c)
+  elseif options.prepareDefaultWhenReady==true then prepareMemoryWhenReady(c)end
+  self.ticking=false;return good
+ end
+ function b:prepareDefaultMemory()
+  assert(not self.stopped,'Druid candidate stopped');local c=context();assert(not record and not next(queue),'Druid form completion is pending')
+  local component=c.pawn.ShapeShiftComponent;assert(not valid(component.Data)and not valid(component.AppliedData),'Restore defaults only in original human form')
+  instances(c,function(a)assert(not(a.bIsActive and a:IsA('/Script/DungeonCrawler.GA_PlayerShapeShiftCastBase')),'An original shape cast is active')end)
+  each(FindAllOf('GameShapeShiftSelectGroupWidget')or{},32,function(w)if valid(w)and same(w:GetOwningPlayerPawn(),c.pawn)and same(w:GetWorld(),c.world)then local v=w:GetVisibility();assert(v~=0 and v~=3 and v~=4,'Close the original shape wheel first')end end)
+  local bank=memorySlot(c);local source=LoadAsset(DEFAULT);assert(valid(source)and #source.Item.ShapeShifts==5,'Original Druid default memory missing')
+  local memory=c.pawn.ClassShapeShiftComponent;local prior,seen={},{}
+  each(memory.ShapeShiftDatas,10,function(d)
+   local id=str(d.ShapeShiftId.PrimaryAssetName);local n=id:match('^Id_ShapeShift_(.+)$');assert((allowed[n]or n=='Penguin')and not seen[n],'Custom native memory is not the known training baseline');seen[n]=true
+   prior[#prior+1]={ShapeShiftId={PrimaryAssetType={Name=d.ShapeShiftId.PrimaryAssetType.Name},PrimaryAssetName=d.ShapeShiftId.PrimaryAssetName},ShapeShiftTag={TagName=d.ShapeShiftTag.TagName},SlotIndex=d.SlotIndex,SequenceIndex=d.SequenceIndex}
+  end)
+  assert(#prior==5 or #prior==6,'Original memory baseline differs');for _,n in ipairs(ORDER)do assert(seen[n],'Original memory baseline is incomplete')end
+  local desired={};each(source.Item.ShapeShifts,5,function(id,i)
+   local n=ORDER[i];assert(str(id.PrimaryAssetName)=='Id_ShapeShift_'..n and str(id.PrimaryAssetType.Name)=='DesignDataShapeShift','Original five-form default order differs')
+   local asset=definition(n);desired[i]={ShapeShiftId=id,ShapeShiftTag=asset.ShapeShiftTag,SlotIndex=(bank-1)*5+i-1,SequenceIndex=(bank-1)*5+i-1}
+  end)
+  local holder=StaticConstructObject(StaticFindObject('/Script/DungeonCrawler.ShapeShiftSlotWidgetBase'),memory);assert(valid(holder),'Native typed shape data holder unavailable')
+  local function publish(entries)
+   memory.ShapeShiftDatas:Empty();for i,d in ipairs(entries)do local h=holder.ShapeShiftData;h.ShapeShiftId=d.ShapeShiftId;h.ShapeShiftTag=d.ShapeShiftTag;h.SlotIndex=d.SlotIndex;h.SequenceIndex=d.SequenceIndex;memory.ShapeShiftDatas[i]=h end
+   memory:OnRep_ShapeShiftDatas()
+  end
+  local ok,err=pcall(publish,desired);if not ok then local restored,why=pcall(publish,prior);assert(restored,'Original memory rollback failed: '..tostring(why));error(err)end
+  self.lastStage='published_original_five_form_default';return{called=true,count=5,bank=bank}
+ end
+ local function memoryConfiguration(c,detailed)
+  local memory=c.pawn.ClassShapeShiftComponent.ShapeShiftDatas
+  local skills=c.pawn.SkillComponent.AccountSkillDatas
+  local revision=c.config_id
+  local parts={tostring(revision or''),tostring(#memory),tostring(#skills)}
+  local details=detailed and{rows={},accounts={},memoryCount=#memory,accountCount=#skills,revision=tostring(revision),revisionType=type(revision)}
+  if revision~=nil and type(revision)~='string'and type(revision)~='number'then return'unsupported_config_revision',false,'unsupported_config_revision',details end
+  if #memory>10 or #skills>2 then return table.concat(parts,'|'),false,'custom_memory_bounds',details end
+  local expected=#memory==5 and ORDER or #memory==6 and LEGACY_ORDER
+  -- Fresh 10393 native initialization uses V2 ShapeShiftData primary IDs for
+  -- its exact six-row bank. The authored V1 default five uses DesignDataShapeShift.
+  local expectedKind=#memory==6 and'ShapeShiftData'or'DesignDataShapeShift'
+  local known=expected~=nil
+  for i=1,#memory do local d=memory[i];local n=expected and expected[i]
+   local id,t,kind=str(d.ShapeShiftId.PrimaryAssetName),tag(d.ShapeShiftTag),str(d.ShapeShiftId.PrimaryAssetType.Name)
+   parts[#parts+1]=table.concat({id,tostring(t),kind,tostring(d.SlotIndex),tostring(d.SequenceIndex)},':')
+   if not n or id~='Id_ShapeShift_'..n or t~='Ability.ShapeShift.'..n or kind~=expectedKind or d.SlotIndex~=i-1 or d.SequenceIndex~=i-1 then known=false end
+   if details then
+    local mismatch={}
+    if not n then mismatch[#mismatch+1]='layout'else
+     if id~='Id_ShapeShift_'..n then mismatch[#mismatch+1]='id'end
+     if t~='Ability.ShapeShift.'..n then mismatch[#mismatch+1]='tag'end
+    end
+    if kind~=expectedKind then mismatch[#mismatch+1]='kind'end
+    if d.SlotIndex~=i-1 then mismatch[#mismatch+1]='slot'end
+    if d.SequenceIndex~=i-1 then mismatch[#mismatch+1]='sequence'end
+    details.rows[i]='memoryRow='..i..' id='..id..' tag='..tostring(t)..' kind='..kind..' slot='..tostring(d.SlotIndex)..' sequence='..tostring(d.SequenceIndex)..' slotType='..type(d.SlotIndex)..' sequenceType='..type(d.SequenceIndex)..' mismatch='..(#mismatch==0 and'none'or table.concat(mismatch,','))..' expected='..tostring(n or'none')..' expectedKind='..expectedKind..' expectedSlot='..(i-1)..' expectedSequence='..(i-1)
+   end
+  end
+  for i=1,#skills do local t=tostring(tag(skills[i].SkillTag));parts[#parts+1]=t;if details then details.accounts[i]='memoryAccount='..i..' tag='..t..' expectedPrimaryMemory='..tostring(i~=1 or t=='Ability.Player.Skill.ShapeShiftMemory1')end end
+  local signature=table.concat(parts,'|')
+  if #memory==0 or #skills==0 then return signature,nil,'waiting_native_memory',details end
+  if #skills~=2 or tag(skills[1].SkillTag)~='Ability.Player.Skill.ShapeShiftMemory1'then return signature,false,'custom_memory_skill_bank',details end
+  return signature,known,known and'known_original_default'or'custom_memory_preserved',details
+ end
+ local function memoryReadiness(c)
+  local component=c.pawn.ShapeShiftComponent
+  if record or next(queue)or next(tickets)then return'waiting_original_cast'end
+  if valid(component.Data)or valid(component.AppliedData)then return'waiting_human'end
+  if #component.AbilitySpecHandles~=0 or #component.GameplayEffectHandles~=0 then return'waiting_native_form_handles'end
+  local casting=false;instances(c,function(a)if a.bIsActive and a:IsA('/Script/DungeonCrawler.GA_PlayerShapeShiftCastBase')then casting=true end end)
+  if casting then return'waiting_original_cast'end
+  local primary;local visible=false
+  each(FindAllOf('GameShapeShiftSelectGroupWidget')or{},32,function(w)
+   if valid(w)and same(read(function()return w:GetOwningPlayerPawn()end),c.pawn)and same(read(function()return w:GetWorld()end),c.world)then
+    local visibility=w:GetVisibility();if visibility~=1 and visibility~=2 then visible=true end
+    if w.WidgetSlotType==1 then assert(not primary,'Ambiguous current original primary wheel');primary=w end
+   end
+  end,'GameShapeShiftSelectGroupWidget')
+  if not primary then return'waiting_primary_wheel'end
+  if visible then return'waiting_closed_wheel'end
+  local slots=primary.ShapeShiftSlots
+  if slots==nil or #slots~=5 then return'waiting_five_slots'end
+  for i=1,5 do if not valid(unwrap(slots[i]))then return'waiting_five_slots'end end
+  return'ready'
+ end
+ local function rejectMemory(memo,why)
+  memo.status='rejected';b.memoryStatus='rejected';b.memoryFailures=b.memoryFailures+1;b.errors=b.errors+1
+  b.memoryError=tostring(why):gsub('[%z\r\n]',' '):sub(1,450)
+  return{called=false,status='rejected',reason=b.memoryError}
+ end
+ migrateLegacyToCurrentWhenReady=function(c)
+  local memory=c.pawn.ClassShapeShiftComponent
+  if #memory.ShapeShiftDatas~=5 then return{called=false,status='not_legacy_five'}end
+  local signature,known,reason=memoryConfiguration(c)
+  if known~=true then return{called=false,status=reason or'custom_memory_preserved'}end
+  if current(memoryMemo,c)and memoryMemo.signature==signature then return{called=false,status=memoryMemo.status}end
+  local ready,status=pcall(memoryReadiness,c)
+  if not ready then memoryMemo=identity(c);memoryMemo.signature=signature;return rejectMemory(memoryMemo,status)end
+  if status~='ready'then b.memoryStatus=status;return{called=false,status=status}end
+  memoryMemo=identity(c);memoryMemo.signature=signature;memoryMemo.status='migrating_current_10393'
+  b.memoryAttempts=b.memoryAttempts+1;b.memoryStatus=memoryMemo.status
+  local prior={};each(memory.ShapeShiftDatas,10,function(d)
+   prior[#prior+1]={ShapeShiftId=d.ShapeShiftId,ShapeShiftTag=d.ShapeShiftTag,SlotIndex=d.SlotIndex,SequenceIndex=d.SequenceIndex}
+  end)
+  local holderClass=StaticFindObject('/Script/DungeonCrawler.ShapeShiftSlotWidgetBase')
+  local function publish(names,currentKind)
+   memory.ShapeShiftDatas:Empty()
+   for i,n in ipairs(names)do
+    local holder=StaticConstructObject(holderClass,memory);assert(valid(holder),'Native typed shape data holder unavailable')
+    local asset=definition(n);local h=holder.ShapeShiftData
+    h.ShapeShiftId.PrimaryAssetType.Name=FName(currentKind and'ShapeShiftData'or'DesignDataShapeShift')
+    h.ShapeShiftId.PrimaryAssetName=FName('Id_ShapeShift_'..n)
+    h.ShapeShiftTag=asset.ShapeShiftTag;h.SlotIndex=i-1;h.SequenceIndex=i-1;memory.ShapeShiftDatas[i]=h
+   end
+   memory:OnRep_ShapeShiftDatas()
+  end
+  local ok,why=pcall(publish,LEGACY_ORDER,true)
+  if not ok then
+   local restored,restoreWhy=pcall(function()
+    memory.ShapeShiftDatas:Empty();for i,d in ipairs(prior)do local holder=StaticConstructObject(holderClass,memory);assert(valid(holder),'Native typed shape data holder unavailable');local h=holder.ShapeShiftData;h.ShapeShiftId=d.ShapeShiftId;h.ShapeShiftTag=d.ShapeShiftTag;h.SlotIndex=d.SlotIndex;h.SequenceIndex=d.SequenceIndex;memory.ShapeShiftDatas[i]=h end
+    memory:OnRep_ShapeShiftDatas()
+   end)
+   if not restored then why=tostring(why)..'; rollback failed: '..tostring(restoreWhy)end
+   return rejectMemory(memoryMemo,why)
+  end
+  local newSignature,newKnown=memoryConfiguration(c)
+  if newKnown~=true or #memory.ShapeShiftDatas~=6 then return rejectMemory(memoryMemo,'Current 10393 memory readback differs')end
+  memoryMemo.signature=newSignature;memoryMemo.status='migrated_current_10393';b.memoryStatus=memoryMemo.status
+  b.memoryPrepared=b.memoryPrepared+1;b.memoryError=nil;b.lastStage='migrated_current_10393_memory'
+  return{called=true,status=b.memoryStatus,count=6}
+ end
+ republishCurrentWhenReady=function(c)
+  local ok,signature,known,reason=pcall(memoryConfiguration,c)
+  if not ok then b.memoryStatus='current_read_failed';b.memoryError=tostring(signature):sub(1,450);return{called=false,status=b.memoryStatus}end
+  local memory=c.pawn.ClassShapeShiftComponent
+  if #memory.ShapeShiftDatas~=6 or known~=true then
+   b.memoryStatus=known==nil and reason or'preserved_non_current_memory';return{called=false,status=b.memoryStatus}
+  end
+  if current(currentMemoryMemo,c)and currentMemoryMemo.signature==signature then
+   b.memoryStatus=currentMemoryMemo.status;return{called=false,status=b.memoryStatus}
+  end
+  local component=c.pawn.ShapeShiftComponent
+  if record or next(queue)or next(tickets)or valid(component.Data)or valid(component.AppliedData)
+   or #component.AbilitySpecHandles~=0 or #component.GameplayEffectHandles~=0 then b.memoryStatus='waiting_current_human';return{called=false,status=b.memoryStatus}end
+  local casting=false;instances(c,function(a)if a.bIsActive and a:IsA('/Script/DungeonCrawler.GA_PlayerShapeShiftCastBase')then casting=true end end)
+  if casting then b.memoryStatus='waiting_original_cast';return{called=false,status=b.memoryStatus}end
+  local primary
+  each(FindAllOf('GameShapeShiftSelectGroupWidget')or{},32,function(w)
+   if valid(w)and same(read(function()return w:GetOwningPlayerPawn()end),c.pawn)and same(read(function()return w:GetWorld()end),c.world)and w.WidgetSlotType==1 then
+    local visibility=w:GetVisibility()
+    if visibility~=1 and visibility~=2 then assert(not primary,'Ambiguous visible current primary wheel');primary=w end
+   end
+  end,'GameShapeShiftSelectGroupWidget')
+  if not primary then b.memoryStatus='waiting_visible_current_wheel';return{called=false,status=b.memoryStatus}end
+  local slots=primary.ShapeShiftSlots
+  if slots==nil or #slots~=5 then b.memoryStatus='waiting_current_five_slots';return{called=false,status=b.memoryStatus}end
+  local populated=0
+  for i=1,5 do
+   local slot=unwrap(slots[i]);if not valid(slot)then b.memoryStatus='waiting_current_five_slots';return{called=false,status=b.memoryStatus}end
+   local id=read(function()return str(slot.ShapeShiftData.ShapeShiftId.PrimaryAssetName)end)
+   if id and id~=''and id~='None'then populated=populated+1 end
+  end
+  currentMemoryMemo=identity(c);currentMemoryMemo.signature=signature
+  if populated==5 then currentMemoryMemo.status='current_native_ready';b.memoryStatus=currentMemoryMemo.status;return{called=false,status=b.memoryStatus}end
+  if populated~=0 then currentMemoryMemo.status='rejected_partial_current_wheel';b.memoryStatus=currentMemoryMemo.status;b.memoryFailures=b.memoryFailures+1;b.errors=b.errors+1;return{called=false,status=b.memoryStatus}end
+  currentMemoryMemo.status='attempted_current_republish';b.memoryAttempts=b.memoryAttempts+1;b.memoryStatus=currentMemoryMemo.status
+  local published,why=pcall(memory.OnRep_ShapeShiftDatas,memory)
+  if not published then currentMemoryMemo.status='current_republish_failed';b.memoryStatus=currentMemoryMemo.status;b.memoryFailures=b.memoryFailures+1;b.errors=b.errors+1;b.memoryError=tostring(why):sub(1,450);return{called=false,status=b.memoryStatus}end
+  for i=1,5 do
+   local slot,data=unwrap(slots[i]),memory.ShapeShiftDatas[i]
+   local slotId=read(function()return str(slot.ShapeShiftData.ShapeShiftId.PrimaryAssetName)end)
+   local memoryId=str(data.ShapeShiftId.PrimaryAssetName)
+   if slotId~=memoryId or tag(slot.ShapeShiftData.ShapeShiftTag)~=tag(data.ShapeShiftTag)or not valid(slot.ShapeShiftDataAsset)then
+    currentMemoryMemo.status='current_republish_readback_failed';b.memoryStatus=currentMemoryMemo.status;b.memoryFailures=b.memoryFailures+1;b.errors=b.errors+1;return{called=false,status=b.memoryStatus}
+   end
+  end
+  currentMemoryMemo.status='current_republished';b.memoryStatus=currentMemoryMemo.status;b.memoryPrepared=b.memoryPrepared+1;b.memoryError=nil;b.lastStage='republished_current_10393_memory'
+  return{called=true,status=b.memoryStatus,count=5}
+ end
+ prepareMemoryWhenReady=function(c)
+  local ok,signature,known,reason=pcall(memoryConfiguration,c)
+  if not ok then
+   local key='unreadable_config:'..tostring(c.config_id or'')
+   if current(memoryMemo,c)and memoryMemo.signature==key then b.memoryStatus=memoryMemo.status;return{called=false,status=b.memoryStatus}end
+   memoryMemo=identity(c);memoryMemo.signature=key;return rejectMemory(memoryMemo,signature)
+  end
+  if current(memoryMemo,c)and memoryMemo.signature==signature then b.memoryStatus=memoryMemo.status;return{called=false,status=b.memoryStatus}end
+  if known==nil then b.memoryStatus=reason;return{called=false,status=reason}end
+  if not known then
+   memoryMemo=identity(c);memoryMemo.signature=signature;memoryMemo.status='preserved_custom_memory'
+   b.memoryStatus=memoryMemo.status;b.memoryReason=reason;b.memoryPreserved=b.memoryPreserved+1
+   return{called=false,status=b.memoryStatus,reason=reason}
+  end
+  local ready,status=pcall(memoryReadiness,c)
+  if not ready then memoryMemo=identity(c);memoryMemo.signature=signature;return rejectMemory(memoryMemo,status)end
+  if status~='ready'then b.memoryStatus=status;return{called=false,status=status}end
+  memoryMemo=identity(c);memoryMemo.signature=signature;memoryMemo.status='attempted'
+  b.memoryAttempts=b.memoryAttempts+1;b.memoryStatus='preparing_original_default'
+  local prepared,result=pcall(b.prepareDefaultMemory,b)
+  if not prepared then return rejectMemory(memoryMemo,result)end
+  -- Publishing changes known six -> original five. Remember the resulting
+  -- scalar configuration, so our own publication cannot schedule a second one.
+  local after,newSignature,newKnown=pcall(memoryConfiguration,c)
+  if not after then return rejectMemory(memoryMemo,newSignature)end
+  if not newKnown then return rejectMemory(memoryMemo,'Original default memory readback differs')end
+  memoryMemo.signature=newSignature;memoryMemo.status='prepared'
+  b.memoryPrepared=b.memoryPrepared+1;b.memoryStatus='prepared';b.memoryError=nil;b.memoryReason=nil
+  result.status='prepared';return result
+ end
+ function b:prepareDefaultMemoryWhenReady()
+  if self.stopped then return{called=false,status='stopped'}end
+  local ok,c=pcall(context)
+  if not ok then self.memoryStatus='waiting_current_druid';return{called=false,status=self.memoryStatus}end
+  return prepareMemoryWhenReady(c)
+ end
+ function b:capture()
+  local before=self.countBefore and self.countBefore[1];local after=self.countAfter and self.countAfter[1]
+  local ok,c=pcall(context);local now=ok and read(function()return countSnapshot(c)end);local live=now and now[1]
+  local report='NATIVE_DRUID_SHAPE schema=1 started='..self.started..' triggered='..self.triggered..' applied='..self.applied..' finished='..self.finished..' errors='..self.errors..' skippedNative='..self.skippedNative..' tracking='..tostring(record~=nil)..' stage='..tostring(self.lastStage or'idle')..' shape='..tostring(self.lastShape or'none')..' countBefore='..tostring(before and before.count)..' countAfter='..tostring(after and after.count)..' actorBefore='..tostring(before and before.actor)..' actorAfter='..tostring(after and after.actor)..' cooldownBefore='..tostring(self.countBefore and self.countBefore.cooldown)..' cooldownAfter='..tostring(self.countAfter and self.countAfter.cooldown)..' chargeBefore='..tostring(before and before.charge)..' chargeAfter='..tostring(after and after.charge)..' countNow='..tostring(live and live.count)..' actorNow='..tostring(live and live.actor)..' cooldownNow='..tostring(now and now.cooldown)..' chargeParityVerified=false memoryStatus='..tostring(self.memoryStatus)..' memoryAttempts='..self.memoryAttempts..' memoryPrepared='..self.memoryPrepared..' memoryFailures='..self.memoryFailures..' memoryPreserved='..self.memoryPreserved..' memoryReason='..tostring(self.memoryReason or'')..' memoryError='..tostring(self.memoryError or'')..' lastError='..tostring(self.lastError or'')..'\n'
+  if ok then
+   local function clean(v)return tostring(v):gsub('[%z\r\n]',' '):sub(1,8192)end
+   local good,signature,known,reason,details=pcall(memoryConfiguration,c,true)
+   if good then
+    report=report..'memoryConfigKnown='..tostring(known)..' reason='..clean(reason)..' memoryMemoMatches='..tostring(current(memoryMemo,c)and memoryMemo.signature==signature or false)..'\n'
+    report=report..'memoryConfigSignature='..clean(signature)..'\nmemoryMemoSignature='..clean(memoryMemo and memoryMemo.signature or'none')..'\n'
+    if details then
+     report=report..'memoryConfigCounts memory='..details.memoryCount..' account='..details.accountCount..' revision='..clean(details.revision)..' revisionType='..details.revisionType..'\n'
+     for _,line in ipairs(details.rows)do report=report..clean(line)..'\n'end
+     for _,line in ipairs(details.accounts)do report=report..clean(line)..'\n'end
+    end
+   else report=report..'memoryConfigReadError='..clean(signature)..'\n'end
+  end
+  return report
+ end
+ function b:reset()tickets={};queue={};record=nil;memoryMemo=nil;currentMemoryMemo=nil end
+ function b:stop()self.stopped=true;for _,h in ipairs(self.hooks)do pcall(UnregisterHook,h[1],h[2],h[3])end;self.hooks={};self:reset()end
+ return b
+end
+M.new=M.install
+return M

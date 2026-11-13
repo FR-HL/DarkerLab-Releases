@@ -1,0 +1,401 @@
+-- Domain module. Generated from the old single-purpose Lua modules.
+local ROOT=assert(os.getenv('DARKERLAB_ROOT'),'DARKERLAB_ROOT is not set')
+local MOD=_G.__DARKERLAB_MOD_DIR or (ROOT..'/game/'..(os.getenv('DARKERLAB_GAME_COPY') or 'Dark and Darker-NoAC')..'/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/scripts/')
+local function loadDomain(name)
+ local cache=_G.__DARKERLAB_DOMAIN_CACHE or {};_G.__DARKERLAB_DOMAIN_CACHE=cache
+ if not cache[name] then cache[name]=dofile(MOD..name..'.lua') end
+ return cache[name]
+end
+local Core=loadDomain('core')
+local function make_Grounding()
+-- Placement/update prerequisites only. Original movement performs actual landing.
+-- Never set MovementMode, HP, death flags, interaction tags or collision profiles.
+local G={}
+local function valid(o)local ok,v=pcall(function()return o and o:IsValid()end);return ok and v==true end
+function G.enableUpdates(monster)
+ assert(valid(monster)and valid(monster.Mesh)and valid(monster.CharacterMovement),'Original components unavailable')
+ local optimize=monster.OptimizeComponent
+ if valid(optimize)then
+  optimize:SetNeverOptimize(true);optimize:SetFreezeIdle(false);optimize:SetForceRefreshBones(true)
+  optimize:Activate(false);optimize:SetComponentTickEnabled(true)
+ end
+ monster.Mesh.bNoSkeletonUpdate=false;monster.Mesh:SetComponentTickEnabled(true)
+ monster.CharacterMovement:Activate(false);monster.CharacterMovement:SetComponentTickEnabled(true)
+end
+function G.prepare(monster)
+ assert(valid(monster),'Grounding requires an original monster')
+ local living=false
+ for i=1,#monster.AbilitySystemComponent.SpawnedAttributes do
+  local a=monster.AbilitySystemComponent.SpawnedAttributes[i]
+  if valid(a)and a:GetClass():GetFName():ToString()=='DCAttributeSet' then living=a.Health.CurrentValue>0;break end
+ end
+ assert(living,'Do not reposition a dead or uninitialized monster')
+ local movement,mesh=monster.CharacterMovement,monster.Mesh
+ assert(valid(movement)and valid(mesh),'Original movement/mesh unavailable')
+ local origin=monster:K2_GetActorLocation()
+ local radius=monster.CapsuleComponent:GetScaledCapsuleRadius()
+ local destination=nil
+ local offsets={{0,0},{100,0},{-100,0},{0,100},{0,-100},{150,150},{-150,150},{150,-150},{-150,-150}}
+ for _,offset in ipairs(offsets)do
+  local point={X=origin.X+offset[1],Y=origin.Y+offset[2],Z=origin.Z+15}
+  local floor={}
+  movement:K2_ComputeFloorDist(point,220,220,radius,floor)
+  local hit=floor.HitResult
+  if floor.bWalkableFloor and floor.bBlockingHit and hit and hit.bBlockingHit
+   and (not hit.bStartPenetrating or (tonumber(hit.PenetrationDepth)or math.huge)<=0.1)then
+   destination=point;break
+  end
+ end
+ assert(destination,'No nonpenetrating walkable spawn candidate; keep original actor unchanged')
+ local changed=destination.X~=origin.X or destination.Y~=origin.Y
+ if changed then assert(monster:K2_SetActorLocation(destination,false,{},true),'Original actor placement failed')end
+ G.enableUpdates(monster)
+ return {moved=changed,from=origin,to=destination,mode=movement.MovementMode,falling=movement:IsFalling()}
+end
+return G
+
+end
+local Grounding=make_Grounding()
+local function make_AiStart()
+local ROOT=assert(os.getenv('DARKERLAB_ROOT'),'DARKERLAB_ROOT is not set')
+-- Supply the missing original controller-start callback, once per living actor.
+local A={}
+local Types=Core.types
+local OUT=ROOT..'/src/build/output/native/'
+local RUNTIME=ROOT..'/runtime/'
+local function valid(o)local ok,v=pcall(function()return o and o:IsValid()end);return ok and v==true end
+function A.prepare(m)
+ assert(_G.__AI_PAUSED==true,'Custom AI must remain disabled')
+ assert(Types.isA(m,'DCMonsterBase'),'Original monster inheritance required')
+ assert(m.AbilitySystemComponent.bGASInitilized,'Original GAS initialization required')
+ local c=m.Controller
+ assert(Types.isA(c,'DCMonsterAIController'),'Original monster controller inheritance required')
+ assert(valid(c)and valid(c.BrainComponent)and c.BrainComponent:IsRunning(),'Original BT must already run')
+ assert(valid(c.Pawn)and c.Pawn:GetAddress()==m:GetAddress(),'Original controller possession required')
+ local address=m:GetAddress()
+ if A.completed==address then return 'already_prepared'end
+ local fn,e=package.loadlib(OUT..'training_core.dll','native_training_ai_start_direct');assert(fn,e)
+ local result=fn(c:GetAddress(),address,m.AbilitySystemComponent:GetAddress())
+ assert(result==1 or result==2,'Original AI-start initialization was rejected: '..tostring(result))
+ A.completed=address
+ return result==2 and 'original_already_present'or 'original_started'
+end
+return A
+
+end
+local AiStart=make_AiStart()
+local function make_Bootstrap()
+local ROOT=assert(os.getenv('DARKERLAB_ROOT'),'DARKERLAB_ROOT is not set')
+-- Restore the same shipped setup/AI callbacks for every DCMonsterBase subclass.
+local B={}
+local T=Core.types
+local Positions=Core.positions
+local OUT=ROOT..'/src/build/output/native/'
+local RUNTIME=ROOT..'/runtime/'
+local BuildProfile=dofile(MOD..'build_profile.lua')
+local state=_G.__DARKERLAB_COMMON_BOOTSTRAP or{};_G.__DARKERLAB_COMMON_BOOTSTRAP=state
+function B.ready(m)
+ if not T.isA(m,'DCMonsterBase')then return false,'not_original_monster'end
+ local ok,why=pcall(function()
+  assert(m:HasAuthority(),'no_authority')
+  local data=m.DesignDataAssetMonster
+  if not T.valid(data)then
+   local okGet,value=pcall(function()return m:GetMonsterDataAsset()end)
+   if okGet and T.valid(value)then data=value end
+  end
+  if not T.valid(data)then data=m.MonsterDataAsset end
+  assert(T.valid(data),'monster_design_data_not_ready')
+  local abilities=data.Abilities
+  local effects=data.Effects
+  if abilities~=nil then assert(#abilities>0,'design_abilities_not_ready')end
+  if effects~=nil then assert(#effects>0,'design_effects_not_ready')end
+ end)
+ return ok,ok and'original_data_ready'or tostring(why)
+end
+function B.initialize(m)
+ assert(T.isA(m,'DCMonsterBase'),'Original DCMonsterBase required')
+ Positions.captureMonster(m)
+ local id=T.identity(m);local s=state[id]or{};state[id]=s
+ if m.AbilitySystemComponent.bGASInitilized then s.gas=true;return #m.AbilitySystemComponent.AbilityHandleDataArray.Items end
+ local ready,why=B.ready(m);assert(ready,why)
+ assert(not s.initializing,'Reentrant original GAS setup')
+ s.initializing=true
+ local ok,e=pcall(function()
+  local initialize=assert(package.loadlib(OUT..BuildProfile.core,'native_training_initialize_direct'))
+  assert(initialize(m:GetAddress(),m.AbilitySystemComponent:GetAddress())==1,'Original GAS callback was rejected')
+
+  assert(m.AbilitySystemComponent.bGASInitilized,'Original GAS callback did not complete')
+ end)
+ s.initializing=false;assert(ok,e);s.gas=true
+ return #m.AbilitySystemComponent.AbilityHandleDataArray.Items
+end
+function B.start(m)
+ assert(T.isA(m,'DCMonsterBase')and m.AbilitySystemComponent.bGASInitilized,'Original GAS required')
+ Positions.captureMonster(m)
+ local id=T.identity(m);local s=state[id]or{};state[id]=s
+ local c=m.Controller
+ assert(T.isA(c,'DCMonsterAIController'),'Original monster controller not ready')
+ assert(T.valid(c.Pawn)and c.Pawn:GetAddress()==m:GetAddress(),'Original possession not ready')
+ local tree=T.valid(m.MonsterBehaviorData)and m.MonsterBehaviorData.MainBehaviorTree or nil
+ if m['Use Custom Behavior Tree']and T.valid(m['Custom Behavior Tree'])then tree=m['Custom Behavior Tree']end
+ assert(T.isA(tree,'BehaviorTree'),'Original configured tree not ready')
+ if s.started then return tree:GetFullName(),'already_started'end
+ -- Existing live actors are adopted without replaying their spawn action.
+ local running=T.valid(c.BrainComponent)and c.BrainComponent:IsRunning()
+ if not running then
+  Grounding.enableUpdates(m)
+  assert(c:RunBehaviorTree(tree),'Original configured tree failed')
+  m:SetActorTickEnabled(true);c.BrainComponent:SetComponentTickEnabled(true)
+  assert(T.valid(c.PerceptionComponent),'Original perception missing')
+  c.PerceptionComponent:Activate(false);c.PerceptionComponent:SetComponentTickEnabled(true)
+  m:OnSetAI()
+ end
+ assert(T.valid(c.BrainComponent)and c.BrainComponent:IsRunning(),'Original brain not running')
+ AiStart.prepare(m)
+ if not running then Grounding.enableUpdates(m)end
+ s.started=true
+ return tree:GetFullName(),running and'adopted_original_running_actor'or'original_started'
+end
+return B
+
+end
+local Bootstrap=make_Bootstrap()
+local function make_LifecycleCore()
+-- Host-independent lifecycle state machine. Original behavior stays in adapter.
+local Core={}
+function Core.new(env)
+ local self={records={},order={},events={},generation=0}
+ local function emit(r,phase,why)
+  r.phase=phase;r.reason=why;r.changed=env.now()
+  self.events[#self.events+1]={id=r.id,phase=phase,reason=why,at=r.changed}
+  if env.log then env.log(r.id,phase,why)end
+ end
+ function self.adopt(o,root)
+  if not env.valid(o)then return nil end
+  local id=env.identity(o)
+  if self.records[id]then return self.records[id]end
+  local r={id=id,actor=o,root=root or id,created=env.now()};self.records[id]=r;self.order[#self.order+1]=id
+  if env.onAdopt then env.onAdopt(o)end
+  emit(r,'waiting_data','new_original_actor');return r
+ end
+ function self.tick()
+  if env.discover then for _,pair in ipairs(env.discover(self)or{})do self.adopt(pair.actor,pair.root)end end
+  local initial=#self.order;local initialized=false
+  for _,id in ipairs(self.order)do
+   local r=self.records[id]
+   if r.phase=='ready'and env.valid(r.actor)and env.initialized(r.actor)and env.dead(r.actor)then emit(r,'corpse','natural_death_not_restarted')end
+   if r.phase~='removed'and r.phase~='blocked'and r.phase~='ready'and r.phase~='corpse'then
+    if not env.valid(r.actor)then emit(r,'removed','actor_invalid')
+    elseif env.initialized(r.actor)and env.dead(r.actor)then emit(r,'corpse','natural_death_not_restarted')
+    elseif env.now()-r.created>(env.timeout or 45)then emit(r,'blocked',r.reason or'lifecycle_timeout')
+    elseif r.phase=='waiting_data'then
+     if env.initialized(r.actor)then emit(r,'waiting_controller','original_gas_already_ready')
+     else
+      local ready,why=env.dataReady(r.actor)
+      if ready then
+       local ok,e=pcall(env.initialize,r.actor)
+       if ok and env.initialized(r.actor)then emit(r,'waiting_controller','original_gas_completed');initialized=true
+       else emit(r,'blocked','original_initialize_failed: '..tostring(e))end
+      else r.reason=why end
+     end
+    end
+   end
+  end
+  -- Initialization may synchronously create summons. Discover before AI starts.
+  if initialized and env.discover then for _,pair in ipairs(env.discover(self)or{})do self.adopt(pair.actor,pair.root)end end
+  if #self.order>initial then return end
+  -- Children created later in the queue start before their encounter root.
+  for i=#self.order,1,-1 do local r=self.records[self.order[i]]
+   if r.phase=='waiting_controller'and env.valid(r.actor)then
+    local ready,why=env.controllerReady(r.actor)
+    if ready and r.root==r.id then
+     for _,otherId in ipairs(self.order)do local child=self.records[otherId]
+      if child.root==r.id and child.id~=r.id and child.phase~='ready'and child.phase~='corpse'and child.phase~='removed'then
+       ready=false;why='owned_dependency_'..child.phase..': '..child.id;break
+      end
+     end
+    end
+    if ready then
+     local ok,e=pcall(env.start,r.actor)
+     if ok then emit(r,'ready','original_controller_started')else emit(r,'blocked','original_start_failed: '..tostring(e))end
+    else r.reason=why end
+   end
+  end
+ end
+ function self.clear(root)
+  for i=#self.order,1,-1 do local r=self.records[self.order[i]]
+   if r.root==root and r.phase~='removed'then
+    if env.valid(r.actor)then env.destroy(r.actor)end
+    emit(r,'removed','explicit_encounter_clear')
+   end
+  end
+ end
+ return self
+end
+return Core
+
+end
+local LifecycleCore=make_LifecycleCore()
+local function make_Ownership()
+local ROOT=assert(os.getenv('DARKERLAB_ROOT'),'DARKERLAB_ROOT is not set')
+-- Common encounter ownership graph; independent of monster class names.
+local T=Core.types
+local O={}
+function O.parents(o)
+ local a={}
+ for _,method in ipairs({'GetOwner','GetInstigator','GetAttachParentActor'})do
+  local ok,v=pcall(function()return o[method](o)end);if ok and T.valid(v)then a[#a+1]=v end
+ end
+ for _,name in ipairs({'Summoner','TargetProvider','Spawner','SpawnOwner'})do
+  local ok,v=pcall(function()return o[name]end);if ok and T.valid(v)then a[#a+1]=v end
+ end
+ return a
+end
+function O.belongs(o,owners)
+ local q={o};local visited={}
+ for i=1,24 do local a=q[i];if not a then break end
+  if T.valid(a)then local id=T.identity(a);if owners[id]then return true end
+   if not visited[id]then visited[id]=true;for _,parent in ipairs(O.parents(a))do q[#q+1]=parent end end
+  end
+ end
+ return false
+end
+function O.references(o)
+ local result={};local c=o:GetClass()
+ for _=1,12 do
+  if not T.valid(c)then break end
+  c:ForEachProperty(function(p)
+   pcall(function()
+    local kind=p:GetClass():GetFName():ToString();local name=p:GetFName():ToString()
+    local function take(v)v=T.unwrap(v);if T.isA(v,'Actor')and not T.isA(v,'DCPlayerCharacterBase')and not T.isA(v,'PlayerController')then result[#result+1]=v end end
+    if kind=='ObjectProperty'or kind=='WeakObjectProperty'then take(o[name])
+    elseif kind=='ArrayProperty'then
+     local inner=p:GetInner():GetClass():GetFName():ToString()
+     if inner=='ObjectProperty'or inner=='WeakObjectProperty'then local a=o[name];for i=1,math.min(#a,128)do take(a[i])end end
+    end
+   end)
+  end)
+  c=c:GetSuperStruct()
+ end
+ return result
+end
+function O.collect(root)
+ local owners={[T.identity(root)]=true};local list={root}
+ for i=1,128 do local o=list[i];if not o then break end
+  for _,candidate in ipairs(O.references(o))do local id=T.identity(candidate)
+   if not owners[id]and O.belongs(candidate,owners)then owners[id]=true;list[#list+1]=candidate end
+  end
+ end
+ return list,owners
+end
+return O
+
+end
+local Ownership=make_Ownership()
+local function make_Lifecycle()
+local ROOT=assert(os.getenv('DARKERLAB_ROOT'),'DARKERLAB_ROOT is not set')
+-- One public lifecycle service for roots and any original spawned descendants.
+local existing=_G.__DARKERLAB_COMMON_LIFECYCLE
+if existing and existing.apiVersion==8 then return existing end
+if existing then
+ if existing.timer then _G.__DARKERLAB_SCHEDULER.cancel(existing.timer)end
+ if existing.hookInstalled and existing.hookIds then pcall(UnregisterHook,'/Script/DungeonCrawler.DCGameSpawner:SpawnMonster',existing.hookIds[1],existing.hookIds[2])end
+end
+local T=Core.types
+local B=Bootstrap
+local CoreDomain=Core
+local OwnershipDomain=Ownership
+local Core=LifecycleCore
+local Ownership=OwnershipDomain
+local Positions=CoreDomain.positions
+local Q=assert(_G.__DARKERLAB_SCHEDULER)
+local M={apiVersion=8,roots={},discoveryAt=0,dirty=true}
+local out=assert(io.open(ROOT..'/runtime/common-lifecycle-'..os.date('%Y%m%d-%H%M%S')..'.log','a'))
+local function log(id,phase,why)out:write(os.date('%Y-%m-%d %H:%M:%S')..' '..phase..' '..id..' '..tostring(why)..'\n');out:flush()end
+local function parentRoot(o,core)
+ local queue={o};local seen={}
+ for i=1,16 do local a=queue[i];if not a then break end
+  if T.valid(a)then
+   local id=T.identity(a)
+   local record=core.records[id];if record and record.phase~='removed'then return record.root end
+   if not seen[id]then
+    seen[id]=true
+    for _,method in ipairs({'GetOwner','GetInstigator'})do local ok,v=pcall(function()return a[method](a)end);if ok and T.valid(v)then queue[#queue+1]=v end end
+    -- Common ownership/provider vocabulary, independent of monster species.
+    for _,name in ipairs({'Summoner','TargetProvider','Spawner','SpawnOwner'})do local ok,v=pcall(function()return a[name]end);if ok and T.valid(v)then queue[#queue+1]=v end end
+   end
+  end
+ end
+end
+local function discover(core)
+ if not M.dirty and os.time()-M.discoveryAt<1 then return{}end
+ M.dirty=false;M.discoveryAt=os.time();local found={}
+ for _,o in ipairs(FindAllOf('DCMonsterBase')or{})do
+  if T.valid(o)then
+   local id=T.identity(o)
+   if not core.records[id]then
+    local root=parentRoot(o,core)
+    if root then found[#found+1]={actor=o,root=root}end
+   end
+  end
+ end
+ return found
+end
+local env={now=os.time,valid=T.valid,identity=T.identity,initialized=function(o)return o.AbilitySystemComponent.bGASInitilized end,dead=function(o)local hp=T.health(o);return hp~=nil and hp<=0 end,dataReady=B.ready,initialize=function(o)B.initialize(o);M.dirty=true end,start=B.start,discover=discover,log=log}
+env.onAdopt=Positions.captureMonster
+env.controllerReady=function(o)
+ local c=o.Controller
+ if not T.isA(c,'DCMonsterAIController')then return false,'original_controller_pending'end
+ if not T.valid(c.Pawn)or c.Pawn:GetAddress()~=o:GetAddress()then return false,'original_possession_pending'end
+ local tree=T.valid(o.MonsterBehaviorData)and o.MonsterBehaviorData.MainBehaviorTree or nil
+ if o['Use Custom Behavior Tree']and T.valid(o['Custom Behavior Tree'])then tree=o['Custom Behavior Tree']end
+ return T.isA(tree,'BehaviorTree'),'configured_tree_pending'
+end
+env.destroy=function(o)
+ local c=o.Controller
+ if T.valid(c)and T.valid(c.BrainComponent)then c.BrainComponent:StopLogic('Explicit training switch')end
+ o:K2_DestroyActor();if T.valid(c)then c:K2_DestroyActor()end
+end
+M.core=Core.new(env)
+if existing and existing.core then
+ for _,id in ipairs(existing.core.order)do local prior=existing.core.records[id]
+  if prior.phase~='removed'and T.valid(prior.actor)then
+   local record=M.core.adopt(prior.actor,prior.root);record.phase=prior.phase;record.reason=prior.reason;record.created=prior.created
+   M.roots[prior.root]=true
+  end
+ end
+end
+function M.adopt(o)
+ assert(T.isA(o,'DCMonsterBase'),'Original monster required')
+ assert(_G.__AI_PAUSED==true,'Custom AI must remain disabled')
+ local pc=require('UEHelpers').GetPlayerController()
+ local actorWorld=T.world(o);local currentWorld=T.world(pc)
+ assert(T.valid(pc)and T.valid(actorWorld)and T.valid(currentWorld)and actorWorld:GetAddress()==currentWorld:GetAddress(),'Actor outside active offline world')
+ local r=M.core.adopt(o);M.roots[r.root]=true;M.dirty=true;return r
+end
+function M.status(o)
+ local r=T.valid(o)and M.core.records[T.identity(o)]or nil
+ return r and r.phase or'not_managed',r and r.reason or nil
+end
+function M.clear(o)
+ if not T.valid(o)then return end
+ local id=T.identity(o);local r=M.core.records[id]
+ if not r then M.adopt(o);r=M.core.records[id];M.dirty=true;for _,pair in ipairs(discover(M.core))do M.core.adopt(pair.actor,pair.root)end end
+ local owned=Ownership.collect(o)
+ for i=#owned,2,-1 do local child=owned[i]
+  if T.isA(child,'DCMonsterBase')then M.core.adopt(child,r.root)
+  elseif T.valid(child)then local identity=T.identity(child);child:K2_DestroyActor();log(identity,'removed','original_owned_auxiliary_actor')end
+ end
+ M.core.clear(r.root);M.roots[r.root]=nil
+end
+function M.tick()M.core.tick()end
+M.timer=Q.loop(250,function()local ok,e=pcall(M.tick);if not ok then log('SERVICE','PARTIAL',e)end;return false end)
+-- A spawn event only requests discovery; no Unreal calls are made in the hook.
+local ok,a,b=pcall(RegisterHook,'/Script/DungeonCrawler.DCGameSpawner:SpawnMonster',function()M.dirty=true end,function()M.dirty=true end)
+M.hookInstalled=ok;M.hookIds={a,b};log('SERVICE','START','spawn_hook='..tostring(ok)..' fallback_discovery=1s class_whitelist=NONE')
+_G.__DARKERLAB_COMMON_LIFECYCLE=M
+return M
+
+end
+local Lifecycle=make_Lifecycle()
+return {grounding=Grounding, ai_start=AiStart, bootstrap=Bootstrap, lifecycle_core=LifecycleCore, ownership=Ownership, lifecycle=Lifecycle}

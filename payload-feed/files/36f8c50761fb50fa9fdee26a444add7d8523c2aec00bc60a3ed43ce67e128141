@@ -1,0 +1,666 @@
+const net = require("net");
+const dgram = require("dgram");
+const fs = require("fs");
+const path = require("path");
+const classProfiles = require("./lobby_class_profiles.js");
+const { DC } = require("./proto_runtime.js");
+const P = DC.Packet;
+const encodePacket = (type, value = {}) => type.encode(value).finish();
+const gamePaths = require("./game_paths.js");
+const { frame, decodeTopLevel, bufF64 } = require("./protocol.js");
+const { createHttpLobby } = require("./http_lobby.js");
+const logPath = path.join(process.env.DARKERLAB_ROOT || path.resolve(__dirname, "../../.."), "runtime", "logs", "offline-lobby.log");
+const safeLog = (msg) => {
+  try {
+    fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    fs.appendFileSync(logPath, new Date().toISOString() + " " + String(msg) + "\n");
+  } catch {
+    // Logging must never stop the local server.
+  }
+};
+const log = safeLog;
+try { fs.rmSync(logPath, { force: true }); } catch { }
+process.on("uncaughtException", (e) => { safeLog("UNCAUGHT " + e.message); });
+const TCP_PORT = 29122;
+const HTTP_PORT = 30000;
+// The handoff game-net endpoint must remain distinct from the lobby TCP port.
+const GAME_UDP_PORT = Number(process.env.DARKERLAB_GAME_UDP_PORT || 29123);
+const TEST_HANDOFF = process.env.DARKERLAB_TEST_HANDOFF === "1";
+// 角色选择闸门：原版流程是 login -> CharacterSelect_P -> 角色列表(17/18)
+// -> CHARACTER_SELECT_ENTER(41/42) -> LOBBY_CHARACTER_INFO(43/44)
+// -> LOBBY_ENTER(21/22) -> LOBBY_COMPLETE_NOT(10020)。
+// 旧实现跳过角色选择直接推 10020，客户端没有"已选角色"，大厅职业页因此全空。
+// 这里改为等客户端走链；超过宽限期仍未请求才回退到旧的主动推送，保证不会卡死。
+const CHARACTER_SELECT_GRACE_MS = Number(process.env.DARKERLAB_CHARSELECT_GRACE_MS || 5000);
+// 客户端已经进入角色选择（发了 17）但一直没点选时的兜底时间，避免停在该界面。
+const CHARACTER_SELECT_STALL_MS = Number(process.env.DARKERLAB_CHARSELECT_STALL_MS || 8000);
+
+const token32 = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
+function makeLoginRes(hasCredentials) {
+  return encodePacket(P.SS2C_ACCOUNT_LOGIN_RES, {
+    Result: 1, // SUCCESS（普通登录，无恢复密钥弹窗，让客户端完整建立会话）
+    AccountInfo: { AccountID: "1" },
+    address: "127.0.0.1:29122",
+    sessionId: "sess1",
+    accountId: "1",
+    serverLocation: 1,
+    latencyToken: "lat-token",
+    totalPlaytime: 0,
+    redirectionInfo: {
+      generalReportUrl: "http://127.0.0.1:30000/report",
+      banAppealUrl: "http://127.0.0.1:30000/appeal",
+      knightLinkUrl: "http://127.0.0.1:30000/knight",
+      supportFaqUrl: "http://127.0.0.1:30000/faq",
+      homeUrl: "http://127.0.0.1:30000/home",
+      newsUrl: "http://127.0.0.1:30000/news",
+      suggestionUrl: "http://127.0.0.1:30000/suggest",
+      officialDiscordUrl: "http://127.0.0.1:30000/discord",
+      bugReportUrl: "http://127.0.0.1:30000/bug",
+      reportPlayerUrl: "http://127.0.0.1:30000/reportplayer",
+      securitySettingsFaqUrl: "http://127.0.0.1:30000/securityfaq"
+    },
+    gameType: 10, // DUNGEON_SOLO_ADVENTURE
+    linkPlatformLinkStatus: 0,
+    isLockBanAppeal: 0,
+    banPeriodType: 0,
+    eulaAgreementStatus: 0,
+    permission: 0x7fffffff,
+    dlcInstallInfos: [{ dlcType: 1, dlcPurchasedElapsedTimeMs: 86400000 }],
+    enterTutorial: 1
+  });
+}
+
+const projectRoot = process.env.DARKERLAB_ROOT || path.resolve(__dirname, "../../..");
+const gameExe = gamePaths.gameExecutable(projectRoot);
+log("GAME_EXE " + gameExe);
+const buildRegistry = JSON.parse(fs.readFileSync(path.join(projectRoot, "src", "build", "config", "game-build-profiles.json"), "utf8"));
+const FIXED_GAME_BUILD = String(buildRegistry.active?.gameVersion || "").trim();
+if (!FIXED_GAME_BUILD) throw new Error("game-build-profiles.json missing active.gameVersion");
+process.env.DARKERLAB_GAME_BUILD = FIXED_GAME_BUILD;
+const profiles = classProfiles.loadProfiles(path.join(projectRoot, "src", "build", "cache", "catalog", "profiles", FIXED_GAME_BUILD, "ui-data.json"));
+log(`CLASS_PROFILE_CACHE loaded=${Object.keys(profiles).length} Rogue(perks=${profiles.Rogue.options.perks.length},skills=${profiles.Rogue.options.skills.length}) Bard(musics=${profiles.Bard.options.musics.length}) Druid(shapeShifts=${profiles.Druid.options.shapeShifts.length})`);
+let characterProfile = classProfiles.loadCharacterProfile(projectRoot, FIXED_GAME_BUILD);
+if (characterProfile) log(`CHARACTER_PROFILE loaded class=${characterProfile.className} perks=${characterProfile.equipped.perks.length} skills=${characterProfile.equipped.skills.length} spells=${characterProfile.equipped.spells.length}`);
+else log("CHARACTER_PROFILE none; waiting for character creation");
+const currentProfile = () => {
+  if (!characterProfile || !profiles[characterProfile.className]) return null;
+  if (!characterProfile.options) characterProfile.options = profiles[characterProfile.className].options;
+  return characterProfile;
+};
+const currentClassName = () => currentProfile()?.className || classProfiles.selectedClass(projectRoot);
+function createCharacterProfile(className, nickname, gender) {
+  const classProfile = profiles[className];
+  if (!classProfile) throw new Error(`unknown class from create request: ${className}`);
+  characterProfile = classProfiles.profileFromClass(classProfile, className, nickname, gender, FIXED_GAME_BUILD);
+  classProfiles.saveCharacterProfile(projectRoot, characterProfile);
+  log(`CHARACTER_CREATED class=${className} nickname=${characterProfile.nickname} gender=${characterProfile.gender} perks=${characterProfile.equipped.perks.length} skills=${characterProfile.equipped.skills.length} spells=${characterProfile.equipped.spells.length}`);
+  return characterProfile;
+}
+const classListBody = classProfiles.buildClassListBody();
+const classOptionResponses = new Map([
+  [3041, [3042, "perks"]],
+  [3043, [3044, "skills"]],
+  [3045, [3046, "spells"]],
+  [3047, [3048, "musics"]],
+  [3049, [3050, "shapeShifts"]],
+]);
+function sendClassOptionLists(send, profile, className, reason) {
+  for (const [responseCommand, category] of [
+    [3042, "perks"], [3044, "skills"], [3046, "spells"], [3048, "musics"], [3050, "shapeShifts"],
+  ]) {
+    send(responseCommand, classProfiles.buildOptionListBody(profile, category),
+      `class_${category}_list class=${className} count=${profile.options[category].length} source=${reason}`);
+  }
+}
+
+const policyValues = [[1, 200], [2, 3000], [3, 5], [4, 100], [5, 3000], [6, 5], [7, 0], [8, 10000], [9, 3000], [10, 5], [11, 1], [12, 1], [13, 0], [14, 1], [15, 10], [21, 2], [25, 100], [26, 5], [27, 3600], [28, 3600], [29, 10], [30, 999999], [31, 0], [32, 0], [33, 1], [39, 0], [40, 1], [41, 1], [42, 0], [43, 0], [48, 0], [49, 0], [50, 0], [51, 0], [52, 0], [53, 1], [54, 1], [59, 1], [62, 1], [84, 1]];
+const policyBodyFull = encodePacket(P.SS2C_SERVICE_POLICY_NOT, {
+  policyList: policyValues.map(([policyType, policyValue]) => ({ policyType, policyValue }))
+});
+
+const lobbyCompleteBody = encodePacket(P.SS2C_LOBBY_COMPLETE_NOT, { type: 1 });
+const currencyBody = encodePacket(P.SS2C_LOBBY_ACCOUNT_CURRENCY_LIST_NOT, {
+  currencyInfos: [
+    { currencyType: 1, currencyValue: 100000 },
+    { currencyType: 2, currencyValue: 1000 }
+  ]
+});
+
+// ---- Custom match / matchmaking chain (self-hosted) ----
+const cmSettings = () => ({
+  gameType: 1,
+  dungeonIdTag: "Id_Dungeon_ForgottenCastle",
+  dungeonGrade: 1,
+  maxGameUser: 1,
+  waitGameTimeSec: 30,
+  maxIncludingRarity: 9,
+  isLegendaryStatusOnly: 0,
+  entranceGoldFee: 0,
+  entranceLevel: 1,
+  isRequireFullParty: 0,
+  gearScoreMin: 0,
+  gearScoreMax: 100000,
+  escapeFailApOnOff: 0,
+  rankPointRatio: 0,
+  minStartPlayerCount: 1,
+  skipExpressRoomOnDown: 0,
+  region: 1
+});
+const cmSlot = () => ({
+  slotIndex: 0,
+  isOccupied: 1,
+  isReady: 1,
+  member: {
+    accountId: "1",
+    nickName: nickname("OfflinePlayer"),
+    characterClass: `DesignDataPlayerCharacter:Id_PlayerCharacter_${classProfiles.selectedClass(projectRoot)}`,
+    characterId: "1",
+    gender: 0,
+    level: 1,
+    isPartyLeader: 1
+  },
+  metaLocation: 2
+});
+const roomInfo = () => ({
+  roomId: 1,
+  roomCode: "LOCAL01",
+  hostAccountId: 1,
+  settings: cmSettings(),
+  slots: [cmSlot()],
+  roomState: 1,
+  currentPlayerCount: 1,
+  minStartPlayerCount: 1,
+  maxStartPlayerCount: 1,
+  rosterGroupSize: 1
+});
+const gameServerNot = () => encodePacket(P.SS2C_ENTER_GAME_SERVER_NOT, {
+  port: GAME_UDP_PORT, // passive Unreal game-net UDP probe; not the lobby TCP port
+  ip: "127.0.0.1",
+  sessionId: "sess1",
+  accountId: "1",
+  nickName: nickname("OfflinePlayer"),
+  serviceUrl: "http://127.0.0.1:30000",
+  perfReportStartDelaySec: 0,
+  perfReportEnabled: 0
+});
+
+const CHARACTER_ID = "1";
+const CHARACTER_NICK = "OfflinePlayer";
+const characterClassRef = (className) => `DesignDataPlayerCharacter:Id_PlayerCharacter_${className}`;
+const nickname = (nick) => ({ originalNickName: nick, streamingModeNickName: nick, karmaRating: 0 });
+
+function makeCharObject(id, nick, className = currentClassName(), gender = 0) {
+  // Keep the character-list item minimal and equal to the original handler's
+  // fields. The lobby profile carries equipment separately; malformed list
+  // items can make this build return to an empty character-select page.
+  return {
+    orderIndex: 0,
+    characterId: id,
+    nickName: nickname(nick),
+    characterClass: characterClassRef(className),
+    createAt: Math.floor(Date.now() / 1000),
+    gender,
+    level: 1,
+    equipItemList: currentProfile() ? classProfiles.starterItems(currentProfile()) : []
+  };
+}
+
+// SS2C_ACCOUNT_CHARACTER_LIST_RES（cmd 18）。首次本地账号没有角色时返回空列表，
+// 让客户端进入原版建角流程，而不是用预置角色跳过职业选择。
+function buildCharacterListBody(includeCharacter = Boolean(currentProfile()), pageIndex = 1) {
+  const characterList = includeCharacter
+    ? [makeCharObject(CHARACTER_ID, currentProfile()?.nickname || CHARACTER_NICK, currentClassName(), currentProfile()?.gender || 0)]
+    : [];
+  return encodePacket(P.SS2C_ACCOUNT_CHARACTER_LIST_RES, {
+    totalCharacterCount: characterList.length,
+    pageIndex,
+    characterList,
+    slotInfos: characterList.length ? [{ orderIndex: 0, slotType: 1, slotStatus: 1, expireTimeSec: 0 }] : [],
+    availableSlotCount: 6
+  });
+}
+
+// SS2C_LOBBY_CHARACTER_INFO_RES（cmd 44）：大厅当前角色档案（SCHARACTER_INFO）
+function buildLobbyCharacterInfoBody(className) {
+  const profile = currentProfile();
+  const nick = profile?.nickname || CHARACTER_NICK;
+  return encodePacket(P.SS2C_LOBBY_CHARACTER_INFO_RES, {
+    result: 1,
+    characterDataBase: {
+      accountId: "1",
+      accountNickname: nick,
+      nickName: nickname(nick),
+      characterClass: characterClassRef(className),
+      characterId: profile?.characterId || CHARACTER_ID,
+      gender: profile?.gender || 0,
+      level: 1,
+      CharacterItemList: profile ? classProfiles.starterItems(profile) : []
+    }
+  });
+}
+
+// 新一批 NOT 候选（真实 Id_Dungeon_*，来自 pakchunk500 数据表）
+const REAL_MAPS = ["Crypt", "GoblinCave", "Ruins", "IceCavern", "IceAbyss", "Inferno", "ShipGraveyard", "Firedeep"];
+const mapRotationBody = encodePacket(P.SS2C_ALL_MAP_MATCHMAKING_NOT, {
+  infos: REAL_MAPS.flatMap((map, index) => [
+    { gameType: index * 2 + 1, mapTag: `Id_Dungeon_Random${map}_N_Solo` },
+    { gameType: index * 2 + 2, mapTag: `Id_Dungeon_Random${map}_HR_Solo` }
+  ]),
+  nextRotationDate: "2026-12-31",
+  nextRotationTime: "00:00:00"
+});
+const arenaScheduleBody = encodePacket(P.SS2C_ARENA_SCHEDULE_NOT, {
+  schedules: [{ gameType: 9, beginUnixTime: 0, endUnixTime: 4294967295 }]
+});
+const achievementsBody = encodePacket(P.SS2C_ACHIEVEMENTS_NOT, { result: 1 });
+const workshopBody = encodePacket(P.SS2C_WORKSHOP_INFO_NOT, {});
+const openDungeonBody = encodePacket(P.SS2C_OPEN_DUNGEON_INFO_NOT, {
+  infos: [
+    {
+      dungeonIndex: 1,
+      gameType: 3,
+      gearPoolInfos: [{ gearPoolIndex: 1, minIncludingValue: 0, maxIncludingValue: 100 }],
+      dungeonPoolInfos: [{
+        gearPoolIndex: 1, maxIncludingRarity: 8, isLegendaryStatusOnly: 0,
+        entranceGoldFee: 0, entranceLevel: 1, isRequireFullParty: 0,
+        anteDirection: 0, anteBaselineGearScore: 0, anteGoldPerPoint: 0, anteCurvePoints: ""
+      }],
+      dungeonIdTag: "Id_Dungeon_RandomCrypt_N_Solo"
+    },
+    {
+      dungeonIndex: 2,
+      gameType: 3,
+      gearPoolInfos: [{ gearPoolIndex: 1, minIncludingValue: 0, maxIncludingValue: 100 }],
+      dungeonPoolInfos: [{
+        gearPoolIndex: 1, maxIncludingRarity: 8, isLegendaryStatusOnly: 0,
+        entranceGoldFee: 0, entranceLevel: 1, isRequireFullParty: 0,
+        anteDirection: 0, anteBaselineGearScore: 0, anteGoldPerPoint: 0, anteCurvePoints: ""
+      }],
+      dungeonIdTag: "Id_Dungeon_RandomGoblinCave_N_Solo"
+    },
+    {
+      dungeonIndex: 3,
+      gameType: 5,
+      gearPoolInfos: [{ gearPoolIndex: 1, minIncludingValue: 0, maxIncludingValue: 100 }],
+      dungeonPoolInfos: [{
+        gearPoolIndex: 1, maxIncludingRarity: 8, isLegendaryStatusOnly: 0,
+        entranceGoldFee: 0, entranceLevel: 1, isRequireFullParty: 0,
+        anteDirection: 0, anteBaselineGearScore: 0, anteGoldPerPoint: 0, anteCurvePoints: ""
+      }],
+      dungeonIdTag: "Id_Dungeon_RandomCrypt_HR_Solo"
+    }
+  ]
+});
+const dungeonCardBody = encodePacket(P.SS2C_DUNGEON_CARD_INFO_NOT, { highestRankId: "Id_Rank_Season" });
+const extraNotifies = [
+  [10101, openDungeonBody, "open_dungeon_not"],
+  [90, dungeonCardBody, "dungeon_card_not"],
+  [93, encodePacket(P.SS2C_RANK_AUTOMATIC_REWARD_NOT, { result: 1 }), "rank_auto_reward_not"],
+  [94, encodePacket(P.SS2C_SQUIRE_ROYALE_STAT_NOT, { survival: 0, kill: 0 }), "squire_royale_not"],
+  [758, encodePacket(P.SS2C_GEAR_BASE_SCORE_LIST_NOT, {}), "gear_base_score_not"],
+  [759, encodePacket(P.SS2C_MATCH_POOL_REGISTERED_NOT, { matchRemainTimeSec: 0 }), "match_pool_not"],
+  [10700, encodePacket(P.SS2C_TRUSTED_ACCOUNT_INFO_NOT, { result: 1 }), "trusted_not"],
+  [10712, encodePacket(P.SS2C_NEWS_NEW_ARTICLE_NOT, {}), "news_new_article_not"],
+];
+const notifyWave = [
+  [10500, encodePacket(P.SS2C_OPERATE_ANNOUNCE_NOT, {}), "operate_announce"],
+  [10550, encodePacket(P.SS2C_ACCOUNT_STATUS_NOT, {
+    accountStatus: 2,
+    ownedDlcInfos: [{ dlcId: "Id_DLCPack_SeasonalPack", expireSec: 0 }]
+  }), "account_status_not_with_dlc"],
+  [10552, encodePacket(P.SS2C_DLC_INFO_NOT, {
+    dlcInfos: [{
+      dlcId: "Id_DLCPack_SeasonalPack", saleStatus: 1,
+      beginDateMS: 0, endDateMS: 0, expireDateMs: 0
+    }],
+    currentDateMS: Date.now()
+  }), "dlc_info_not_owned"],
+  [55, encodePacket(P.SS2C_LOBBY_REPORT_PUNISH_LIST_NOT, {}), "punish_list"],
+  [70, encodePacket(P.SS2C_LOBBY_MMR_NOT, {}), "lobby_mmr"],
+  [69, encodePacket(P.SS2C_ARENA_STAT_NOT, {}), "arena_stat"],
+  [54, encodePacket(P.SS2C_LOBBY_CHARACTER_LOBBY_EMOTE_NOT, {}), "lobby_emote"],
+  [10100, mapRotationBody, "map_rotation_not"],
+  [10670, arenaScheduleBody, "arena_schedule_not"],
+  [10640, achievementsBody, "achievements_not"],
+  [4001, workshopBody, "workshop_info_not"],
+];
+
+// 只会在"已在大厅"时出现的请求：用于判断客户端跳过了角色选择。
+const LOBBY_ACTIVITY_CMDS = new Set([45, 47, 51, 63, 751, 10001, 2701, 3001, 3031, 3041, 3043, 3045, 3047, 3049, 3071, 3073, 3075, 3078, 3080, 3082, 3084, 4201, 4301]);
+
+const tcpServer = net.createServer((socket) => {
+  log(`TCP connect ${socket.remoteAddress}:${socket.remotePort}`);
+  let acc = Buffer.alloc(0);
+  // 本连接的大厅会话状态：角色选择 -> 大厅的推进由客户端请求驱动。
+  const session = {
+    className: currentClassName(),
+    characterListSent: false,
+    lobbyCharacterInfoSent: false,
+    lobbyCompleteSent: false,
+  };
+  const flowTimers = [];
+  let aliveTimer = null;
+  const send = (c, b, t, seq = 0) => { if (!socket.destroyed) socket.write(frame(c, b, seq)); log(`${t} cmd=${c} bodylen=${b.length} seq=${seq}`); };
+  const later = (ms, fn) => {
+    const timer = setTimeout(() => {
+      const index = flowTimers.indexOf(timer);
+      if (index >= 0) flowTimers.splice(index, 1);
+      if (!socket.destroyed) fn();
+    }, ms);
+    flowTimers.push(timer);
+  };
+  const clearFlowTimers = () => { while (flowTimers.length) clearTimeout(flowTimers.pop()); };
+  const pushCharacterList = (reason, seq = 0) => {
+    if (session.characterListSent) return;
+    session.characterListSent = true;
+    const profile = currentProfile();
+    send(18, buildCharacterListBody(Boolean(profile), 1), `charlist ${reason} class=${session.className} created=${Boolean(profile)}`, seq);
+  };
+  const pushLobbyCharacterInfo = (reason) => {
+    if (!currentProfile()) {
+      log(`lobbycharinfo skipped ${reason}: no character profile`);
+      return;
+    }
+    session.lobbyCharacterInfoSent = true;
+    send(44, buildLobbyCharacterInfoBody(session.className), `lobbycharinfo ${reason} class=${session.className}`);
+  };
+  // SS2C_LOBBY_COMPLETE_NOT 只推一次；没有角色时不能跳过建角直接完成大厅。
+  const pushLobbyNotifies = (reason) => {
+    if (session.lobbyCompleteSent) return;
+    if (!currentProfile()) {
+      log(`lobby_notifies skipped ${reason}: no character profile`);
+      return;
+    }
+    session.lobbyCompleteSent = true;
+    clearFlowTimers();
+    // 角色档案必须在大厅完成前到客户端，否则职业页没有"当前角色"可绑定。
+    if (!session.lobbyCharacterInfoSent) pushLobbyCharacterInfo("before_lobby_complete");
+    for (const [c, b, t] of notifyWave) send(c, b, `${t} phase=${reason}`);
+    for (const [c, b, t] of extraNotifies) send(c, b, `${t} phase=${reason}`);
+    send(10020, lobbyCompleteBody, `lobby_complete_not phase=${reason}`);
+    later(1500, () => pushLobbyCharacterInfo("late_lobby_info"));
+  };
+  socket.on("data", (d) => {
+    acc = Buffer.concat([acc, d]);
+    while (acc.length >= 8) {
+      const len = acc.readUInt32LE(0);
+      const cmd = acc.readUInt16LE(4);
+      const flag = acc.readUInt16LE(6);
+      if (len < 8 || acc.length < len) break;
+      const body = acc.subarray(8, len);
+      acc = acc.subarray(len);
+      let dec = ""; try { dec = decodeTopLevel(body); } catch (e) { dec = "err"; }
+      log(`RECV cmd=${cmd} flag=0x${flag.toString(16)} len=${len} [${dec}]`);
+      if (cmd === 1) send(2, encodePacket(P.SS2C_ALIVE_RES), "alive<");
+      else if (cmd === 30001) send(30002, encodePacket(P.SS2D_SESSION_HELLO_RES, { result: 1, sessionId: 777 }), "session_hello_res");
+      else if (cmd === 11) {
+        const hasCreds = /f1=/.test(dec);
+        session.className = currentClassName();
+        log(`login hasCredentials=${hasCreds} class=${session.className} profile=${Boolean(currentProfile())}`);
+        send(12, makeLoginRes(hasCreds), hasCreds ? "login_res_SUCCESS" : "login_res_register");
+        send(25, classListBody, `classlist_not classes=${classProfiles.LOBBY_CLASSES.length} shop_refs=omitted`);
+        send(53, currencyBody, "currency_not");
+        send(10050, policyBodyFull, "policy_full");
+        // CharacterSelect_P consumes the list response during its bootstrap.
+        // Send the empty list for a fresh account so the original creation
+        // screen is shown instead of a pre-created character.
+        later(300, () => pushCharacterList("login_bootstrap"));
+      } else if (cmd === 23) {
+        send(24, encodePacket(P.SS2C_ACCOUNT_AGREE_ANSWER_RES, { result: 1 }), "agree_res");
+        pushLobbyNotifies("agree");
+      } else if (cmd === 26) {
+        send(27, encodePacket(P.SS2C_USER_HW_INFO_RES), "hwinfo");
+        send(10692, encodePacket(P.SS2C_PING_INFO_NOT, { result: 1 }), "ping_info_not");
+        send(10693, encodePacket(P.SS2C_PING_CHECKING_NETWORK_NOT, { result: 1 }), "ping_checking_not");
+        if (!aliveTimer) aliveTimer = setInterval(() => send(5, encodePacket(P.SS2C_ALIVE_REVERSE_NOT), "reverse_alive"), 2000); // 周期推送已禁用：覆盖客户端自带的冒险模式可用状态（试验）
+      } else if (cmd === 6) send(7, encodePacket(P.SS2C_ALIVE_REVERSE_RES), "reverse_alive_res");
+      else if (cmd === 3031) {
+        const profile = currentProfile();
+        if (profile) {
+          const className = profile.className;
+          // 职业页按"当前大厅角色"取职业；角色档案还没下发的，这里先补上。
+          pushLobbyCharacterInfo("class_page");
+          send(3032, classProfiles.buildEquipInfoBody(profile), `class_equip_info class=${className} equipped=${Object.values(profile.equipped).reduce((n, rows) => n + rows.length, 0)} choices=${Object.values(profile.options).reduce((n, rows) => n + rows.length, 0)}`);
+          // This client build stops after slot/level bootstrap unless the class
+          // option datasets are already published to its class-page model.
+          // Send each normal S2C list once here; if the client also asks for a
+          // particular list, its request branch below returns the same data.
+          sendClassOptionLists(send, profile, className, "class_page_bootstrap");
+        } else log("class_page skipped: no character profile");
+      }
+      else if (classOptionResponses.has(cmd)) {
+        const [responseCommand, category] = classOptionResponses.get(cmd);
+        const profile = currentProfile();
+        if (profile) {
+          const responseBody = classProfiles.buildOptionListBody(profile, category);
+          send(responseCommand, responseBody, `class_${category}_list class=${profile.className} count=${profile.options[category].length}`);
+        } else log(`class_${category}_list skipped: no character profile`);
+      }
+      else if (cmd === 2701) {
+        const profile = currentProfile();
+        if (profile) send(2702, classProfiles.buildTrainingInfoBody(`Id_PlayerCharacter_${profile.className}`), `training_info class=${profile.className} state=none`);
+        else log("training_info skipped: no character profile");
+      }
+      else if (cmd === 3001) send(3002, classProfiles.buildClassLevelInfoBody(), "class_level_info level=1 progression=not_configured");
+      else if (cmd === 17) {
+        session.className = currentClassName();
+        session.characterListSent = true;
+        clearFlowTimers();
+        send(18, buildCharacterListBody(Boolean(currentProfile()), 1), `charlist_res class=${session.className} created=${Boolean(currentProfile())} page=1`);
+        if (!currentProfile()) log("charlist empty: waiting for C2S_ACCOUNT_CHARACTER_CREATE_REQ");
+      }
+      else if (cmd === 63) {
+        send(64, encodePacket(P.SS2C_LOBBY_RANDOM_MATCHMAKING_RES, { result: 1 }), "random_match_res");
+        if (TEST_HANDOFF) setTimeout(() => send(753, gameServerNot(), "test_enter_game_server_not"), 500);
+      }
+      else if (cmd === 751) {
+        send(752, encodePacket(P.SS2C_AUTO_MATCH_REG_RES, { result: 1 }), "auto_match_res");
+        if (TEST_HANDOFF) setTimeout(() => send(753, gameServerNot(), "test_enter_game_server_not"), 300);
+      }
+      else if (cmd === 4301) send(4302, encodePacket(P.SS2C_CUSTOM_MATCH_CREATE_RES, { result: 1, roomInfo: roomInfo() }), "cm_create_res");
+      else if (cmd === 4303) {
+        send(4304, encodePacket(P.SS2C_CUSTOM_MATCH_SETTINGS_UPDATE_RES, { result: 1 }), "cm_settings_res");
+        send(4338, encodePacket(P.SS2C_CUSTOM_MATCH_SETTINGS_UPDATE_NOT, {
+          settings: cmSettings(),
+          minStartPlayerCount: 1,
+          maxStartPlayerCount: 1,
+          rosterGroupSize: 1
+        }), "cm_settings_not");
+      }
+      else if (cmd === 4305) {
+        send(4306, encodePacket(P.SS2C_CUSTOM_MATCH_START_RES, { result: 1 }), "cm_start_res");
+        setTimeout(() => {
+          send(4342, encodePacket(P.SS2C_CUSTOM_MATCH_STARTED_NOT), "cm_started_not");
+          if (TEST_HANDOFF) setTimeout(() => send(753, gameServerNot(), "test_enter_game_server_not"), 500);
+        }, 300);
+      }
+      else if (cmd === 4309) send(4310, encodePacket(P.SS2C_CUSTOM_MATCH_JOIN_RES, { result: 1, roomInfo: roomInfo() }), "cm_join_res");
+      else if (cmd === 4321) send(4322, encodePacket(P.SS2C_CUSTOM_MATCH_READY_RES, { result: 1 }), "cm_ready_res");
+      else if (cmd === 10680) send(10681, encodePacket(P.SS2C_DLC_INSTALLED_CHECK_RES, {
+        result: 1,
+        dlcType: body.length ? Number(bufF64(body, 1)) : 1,
+        dlcInstallInfos: [{ dlcType: 1, dlcPurchasedElapsedTimeMs: 86400000 }]
+      }), "dlc_installed_res_owned");
+      else if (cmd === 2562) send(2563, encodePacket(P.SS2C_SHOP_LEGEND_UPGRADE_RES, { result: 1 }), "legend_upgrade_res");
+      else if (cmd === 4319) send(4320, encodePacket(P.SS2C_CUSTOM_MATCH_LEAVE_RES, { result: 1 }), "cm_leave_res");
+      else if (cmd === 4307) send(4308, encodePacket(P.SS2C_CUSTOM_MATCH_DELETE_RES, { result: 1 }), "cm_delete_res");
+      else if (cmd === 4327) send(4328, encodePacket(P.SS2C_CUSTOM_MATCH_BAN_LIST_RES, { result: 1 }), "cm_banlist_res");
+      else if (cmd === 4201) send(4202, encodePacket(P.SS2C_PARTY_FINDER_LIST_RES, { result: 1, currentPage: 1, maxPage: 0 }), "partyfinder_list_res");
+      else if (cmd === 15) {
+        let created = null;
+        try {
+          const request = classProfiles.decodeCharacterCreate(body);
+          log(`RECV create nick=${JSON.stringify(request.nickname)} class=${request.className || "invalid"} gender=${request.gender}`);
+          if (request.className) created = createCharacterProfile(request.className, request.nickname || CHARACTER_NICK, request.gender);
+        } catch (error) {
+          log("create request rejected: " + error.message);
+        }
+        send(16, encodePacket(P.SS2C_ACCOUNT_CHARACTER_CREATE_RES, { result: created ? 1 : 10 }), created ? "create_res" : "create_res_invalid_class");
+        if (created) {
+          session.className = created.className;
+          session.characterListSent = false;
+          // The client requests the character list itself after create_res;
+          // do not push an unsolicited list while the creation UI is closing.
+        }
+      } else if (cmd === 19) {
+        classProfiles.deleteCharacterProfile(projectRoot);
+        characterProfile = null;
+        session.className = currentClassName();
+        session.characterListSent = false;
+        session.lobbyCharacterInfoSent = false;
+        session.lobbyCompleteSent = false;
+        send(20, encodePacket(P.SS2C_ACCOUNT_CHARACTER_DELETE_RES, { result: 1 }), "chardelete_res");
+        later(150, () => pushCharacterList("after_delete"));
+      }
+      else if (cmd === 21) {
+        if (!currentProfile()) {
+          send(22, encodePacket(P.SS2C_LOBBY_ENTER_RES, { result: 10, accountId: "1" }), "lobby_enter_res_no_character");
+        } else {
+          session.className = currentProfile().className;
+          send(22, encodePacket(P.SS2C_LOBBY_ENTER_RES, { result: 1, accountId: "1" }), "lobby_enter_res");
+          later(200, () => pushLobbyNotifies("lobby_enter"));
+        }
+      }
+      // C2S_CHARACTER_SELECT_ENTER_REQ(41)：客户端已进入角色选择界面并确认角色。
+      // 回 S2C_CHARACTER_SELECT_ENTER_RES(42) 后补发角色档案(44)，再完成大厅加载。
+      else if (cmd === 41) {
+        if (!currentProfile()) {
+          send(42, encodePacket(P.SS2C_CHARACTER_SELECT_ENTER_RES, { result: 10 }), "charselect_res_no_character");
+        } else {
+          session.className = currentProfile().className;
+          log(`character_select_enter class=${session.className}`);
+          clearFlowTimers();
+          send(42, encodePacket(P.SS2C_CHARACTER_SELECT_ENTER_RES, { result: 1 }), "charselect_res");
+          later(300, () => { if (!session.lobbyCharacterInfoSent) pushLobbyCharacterInfo("charselect_push"); });
+          later(1200, () => pushLobbyNotifies("charselect"));
+        }
+      }
+      // C2S_LOBBY_CHARACTER_INFO_REQ(43)：客户端索取大厅当前角色（属性/职业/装备槽）。
+      else if (cmd === 43) {
+        if (!currentProfile()) {
+          log("lobbycharinfo skipped: no character profile");
+        } else {
+          session.className = currentProfile().className;
+          pushLobbyCharacterInfo("res");
+          later(400, () => pushLobbyNotifies("lobbycharinfo"));
+        }
+      }
+      // C2S_CLASS_ITEM_MOVE_REQ(3071)：职业页的通用槽位移动。
+      else if (cmd === 3071) {
+        const profile = currentProfile();
+        if (profile) {
+          try {
+            const move = classProfiles.decodeClassItemMove(body);
+            log(`class_item_move old=${JSON.stringify(move.oldMove)} new=${JSON.stringify(move.newMove)}`);
+            classProfiles.applyClassItemMove(profile, move.oldMove, move.newMove);
+            classProfiles.saveCharacterProfile(projectRoot, profile);
+            send(3072, classProfiles.encodeClassItemMoveResult(move.oldMove || { index: 0, type: 0, moveId: "", move: 0 }, move.newMove || { index: 0, type: 0, moveId: "", move: 0 }), "class_item_move_res");
+          } catch (error) {
+            log("class_item_move rejected: " + error.message);
+            send(3072, classProfiles.encodeClassItemMoveResult({ index: 0, type: 0, moveId: "", move: 0 }, { index: 0, type: 0, moveId: "", move: 0 }), "class_item_move_res_rejected");
+          }
+        } else log("class_item_move skipped: no character profile");
+      }
+      // C2S_CLASS_SPELL_SLOT_MOVE_REQ(3073) / SEQUENCE_CHANGE(3075)。
+      else if (cmd === 3073 || cmd === 3075) {
+        const profile = currentProfile();
+        if (profile) {
+          try {
+            const request = classProfiles.decodeClassStringIndex(body);
+            const current = classProfiles.spellsForResponse(profile).find((row) => row.spellId === request.id);
+            const slotIndex = cmd === 3073 ? request.index : current?.slotIndex || 0;
+            const sequenceIndex = cmd === 3075 ? request.index : current?.sequenceIndex || 0;
+            classProfiles.selectSpell(profile, request.id, slotIndex, sequenceIndex);
+            classProfiles.saveCharacterProfile(projectRoot, profile);
+            send(cmd === 3073 ? 3074 : 3076, classProfiles.encodeSpellListResult(classProfiles.spellsForResponse(profile)), cmd === 3073 ? "spell_slot_move_res" : "spell_sequence_res");
+          } catch (error) {
+            log(`spell_move rejected cmd=${cmd}: ${error.message}`);
+            send(cmd === 3073 ? 3074 : 3076, classProfiles.encodeResult(10), "spell_move_res_rejected");
+          }
+        } else log("spell_move skipped: no character profile");
+      }
+      // C2S_CLASS_MUSIC_SLOT_MOVE_REQ(3078) / SEQUENCE_CHANGE(3080)。
+      else if (cmd === 3078 || cmd === 3080) {
+        const profile = currentProfile();
+        if (profile) {
+          try {
+            const request = classProfiles.decodeClassStringIndex(body);
+            const current = classProfiles.musicsForResponse(profile).find((row) => row.musicId === request.id);
+            const slotIndex = cmd === 3078 ? request.index : current?.slotIndex || 0;
+            const sequenceIndex = cmd === 3080 ? request.index : current?.sequenceIndex || 0;
+            classProfiles.selectMusic(profile, request.id, slotIndex, sequenceIndex);
+            classProfiles.saveCharacterProfile(projectRoot, profile);
+            send(cmd === 3078 ? 3079 : 3081, classProfiles.encodeMusicListResult(classProfiles.musicsForResponse(profile)), cmd === 3078 ? "music_slot_move_res" : "music_sequence_res");
+          } catch (error) {
+            log(`music_move rejected cmd=${cmd}: ${error.message}`);
+            send(cmd === 3078 ? 3079 : 3081, classProfiles.encodeResult(10), "music_move_res_rejected");
+          }
+        } else log("music_move skipped: no character profile");
+      }
+      // C2S_CLASS_SHAPESHIFT_SLOT_MOVE_REQ(3082) / SEQUENCE_CHANGE(3084)。
+      else if (cmd === 3082 || cmd === 3084) {
+        const profile = currentProfile();
+        if (profile) {
+          try {
+            const request = classProfiles.decodeClassStringIndex(body);
+            const current = classProfiles.shapeShiftsForResponse(profile).find((row) => row.shapeShiftId === request.id);
+            const slotIndex = cmd === 3082 ? request.index : current?.slotIndex || 0;
+            const sequenceIndex = cmd === 3084 ? request.index : current?.sequenceIndex || 0;
+            classProfiles.selectShapeShift(profile, request.id, slotIndex, sequenceIndex);
+            classProfiles.saveCharacterProfile(projectRoot, profile);
+            send(cmd === 3082 ? 3083 : 3085, classProfiles.encodeShapeShiftListResult(classProfiles.shapeShiftsForResponse(profile)), cmd === 3082 ? "shapeshift_slot_move_res" : "shapeshift_sequence_res");
+          } catch (error) {
+            log(`shapeshift_move rejected cmd=${cmd}: ${error.message}`);
+            send(cmd === 3082 ? 3083 : 3085, classProfiles.encodeResult(10), "shapeshift_move_res_rejected");
+          }
+        } else log("shapeshift_move skipped: no character profile");
+      }
+      else if (cmd === 45) send(46, encodePacket(P.SS2C_OPEN_LOBBY_MAP_RES), "openmap_res");
+      else if (cmd === 47) send(48, encodePacket(P.SS2C_LOBBY_REGION_SELECT_RES, { result: 1, region: body[1] || 0 }), "region_res");
+      else if (cmd === 51) send(52, encodePacket(P.SS2C_LOBBY_GAME_TYPE_SELECT_RES, { result: 1 }), "gametype_res");
+      else if (cmd === 10001) send(10002, encodePacket(P.SS2C_META_LOCATION_RES, { location: body[1] || 0 }), "meta_res");
+      else if (cmd === 10690) {
+        send(10691, encodePacket(P.SS2C_PING_INFO_RES, {
+          result: 1,
+          urls: ["127.0.0.1:30000"],
+          authToken: "localtoken",
+          expiredMs: 600000,
+          tryPingCnt: 1
+        }), "ping_info_res");
+        send(10694, encodePacket(P.SS2C_PING_REGION_SELECT_NOT, { result: 1, region: 1 }), "ping_region_not");
+      }
+      else if (cmd === 10701) send(10702, encodePacket(P.SS2C_TRUSTED_ACCOUNT_INFO_RES, { result: 1 }), "trusted_res");
+      else if (cmd === 10710) send(10711, encodePacket(P.SS2C_NEWS_ENDPOINT_RES, {
+        result: 1,
+        allUrl: "http://127.0.0.1:30000/news",
+        recentUrl: "http://127.0.0.1:30000/news/recent",
+        articleUrl: "http://127.0.0.1:30000/news/article"
+      }), "news_res_with_urls");
+      else if (cmd === 10060) send(10061, encodePacket(P.SS2C_RE_LOGIN_RES, { isReconnect: 0 }), "relogin_res");
+      else if (cmd === 10720) log("TUTORIAL_PROGRESS " + dec);
+      else log(`UNHANDLED cmd=${cmd} len=${body.length} hex=${body.subarray(0, 256).toString("hex")}`);
+      // 客户端已经在大厅里发业务请求（页面/地图/匹配）说明它已跳过角色选择，
+      // 此时立即补大厅完成通知，避免干等宽限期。
+      if (!session.lobbyCompleteSent && LOBBY_ACTIVITY_CMDS.has(cmd)) later(50, () => pushLobbyNotifies("lobby_activity"));
+    }
+  });
+  socket.on("close", () => { clearFlowTimers(); if (aliveTimer) { clearInterval(aliveTimer); aliveTimer = null; } log("close"); });
+  socket.on("error", (e) => log("sockerr " + e.message));
+});
+tcpServer.on("error", (e) => { log("listen err " + e.message); process.exit(1); });
+tcpServer.listen(TCP_PORT, "127.0.0.1", () => {
+  log(`TCP READY testHandoff=${TEST_HANDOFF} gameUdp=${GAME_UDP_PORT}`);
+  createHttpLobby({ log, classProfiles, profiles, projectRoot, tcpPort: TCP_PORT, httpPort: HTTP_PORT });
+});
+
+// Capture the first game-net datagrams separately from lobby protobuf TCP.
+// This probe is passive: it neither fabricates nor answers Unreal packets.
+const gameUdp = dgram.createSocket("udp4");
+gameUdp.on("message", (message, remote) => {
+  log(`GAME_UDP recv from=${remote.address}:${remote.port} bytes=${message.length} hex=${message.subarray(0, 512).toString("hex")}`);
+});
+gameUdp.on("error", (error) => {
+  log(`GAME_UDP error ${error.message}`);
+  gameUdp.close();
+});
+gameUdp.bind(GAME_UDP_PORT, "127.0.0.1", () => log(`GAME_UDP READY port=${GAME_UDP_PORT} passive=true`));

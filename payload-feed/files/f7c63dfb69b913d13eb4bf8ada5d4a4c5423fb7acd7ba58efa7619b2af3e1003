@@ -1,0 +1,236 @@
+-- Domain module. Generated from the old single-purpose Lua modules.
+local ROOT=assert(os.getenv('DARKERLAB_ROOT'),'DARKERLAB_ROOT is not set')
+local MOD=_G.__DARKERLAB_MOD_DIR or (ROOT..'/game/'..(os.getenv('DARKERLAB_GAME_COPY') or 'Dark and Darker-NoAC')..'/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/scripts/')
+local function loadDomain(name)
+ local cache=_G.__DARKERLAB_DOMAIN_CACHE or {};_G.__DARKERLAB_DOMAIN_CACHE=cache
+ if not cache[name] then cache[name]=dofile(MOD..name..'.lua') end
+ return cache[name]
+end
+local Core=loadDomain('core')
+local World=loadDomain('world')
+local Monster=loadDomain('monster')
+local function make_Runtime()
+local ROOT=assert(os.getenv('DARKERLAB_ROOT'),'DARKERLAB_ROOT is not set')
+-- Compatibility facade. All new selections use the shared data-driven switchboard.
+local R={}
+local C=Core.catalog
+local B=Monster.bootstrap
+local T=Core.types
+R.monsters={}
+for id,r in pairs(C.records)do R.monsters[id]=r end
+for alias,ids in pairs(C.aliases)do if #ids==1 then R.monsters[alias]=C.records[ids[1]]end end
+function R.definition(m)
+ assert(T.isA(m,'DCMonsterBase'),'Original monster required')
+ local r=C.actorRecord(m)
+ if r then return r,r.id end
+ return {name=m:GetClass():GetFName():ToString(),class=m:GetClass():GetFName():ToString()},nil
+end
+R.initialize=B.initialize
+R.start=B.start
+function R.spawn(key)
+ local r=C.resolve(key);local Scenes=World.stages
+ local stage=Scenes.request(r);assert(Scenes.poll(stage),'Scene loading: use the unified asynchronous switch entry')
+ local m=Scenes.spawn(r,stage);_G.__NATIVE_TRAINING_MONSTER=m;return m
+end
+function R.spawnLich()return R.spawn('lich')end
+function R.clear(actors)
+ local life=Monster.lifecycle
+ for _,o in ipairs(actors)do if T.valid(o)then life.clear(o)end end
+ local current=_G.__NATIVE_TRAINING_MONSTER
+ if not T.valid(current)then _G.__NATIVE_TRAINING_MONSTER=nil end
+end
+return R
+
+end
+local Runtime=make_Runtime()
+local function make_Switchboard()
+local ROOT=assert(os.getenv('DARKERLAB_ROOT'),'DARKERLAB_ROOT is not set')
+-- One asynchronous public entry: select -> scene -> original spawn -> lifecycle.
+local previous=_G.__DARKERLAB_SWITCHBOARD;if previous and previous.apiVersion==12 then return previous end
+if previous and previous.timer then _G.__DARKERLAB_SCHEDULER.cancel(previous.timer)end
+local T=Core.types
+local C=Core.catalog
+local Scenes=World.stages
+local Life=Monster.lifecycle
+local Positions=Core.positions
+local Q=assert(_G.__DARKERLAB_SCHEDULER)
+local S=assert(_G.__DARKERLAB_TRAINING_PANEL)
+local M={apiVersion=12,generation=previous and previous.generation or 0,retainedCorpses=previous and previous.retainedCorpses or{}}
+local f=assert(io.open(ROOT..'/runtime/unified-switch-'..os.date('%Y%m%d-%H%M%S')..'.log','a'))
+local function log(s)f:write(os.date('%Y-%m-%d %H:%M:%S')..' '..s..'\n');f:flush()end
+local function set(phase,text)
+ M.phase=phase;S.action=text;log(phase..' '..text)
+ if S.onTrainingPhase then S.onTrainingPhase(phase,text,M.generation)end
+end
+local current=_G.__NATIVE_TRAINING_MONSTER
+if T.isA(current,'DCMonsterBase')then
+ Life.adopt(current);M.current=previous and previous.current or{actor=current,record=C.actorRecord(current)}
+ if M.current.scene and Scenes.activate then Scenes.activate(M.current.scene)end
+ set('adopted','Existing original encounter retained; shared lifecycle enabled')
+end
+function M.clear()
+ M.generation=M.generation+1
+ local pending=M.pending
+ if pending then local restored,e=pcall(Scenes.cancelPreparation,pending);if not restored then log('navigation_restore_failed '..tostring(e))end end
+ if pending and T.valid(pending.actor)and(not M.current or not T.valid(M.current.actor)or pending.actor:GetAddress()~=M.current.actor:GetAddress())then Life.clear(pending.actor)end
+ M.pending=nil;S.spawnStage=nil;S.victoryAt=nil;S.observedMonster=nil;S.restartMonster=nil;S.replayPending=nil
+ if M.current and T.valid(M.current.actor)then Life.clear(M.current.actor)end
+ for _,corpse in ipairs(M.retainedCorpses)do if T.valid(corpse)then Life.clear(corpse)end end
+ M.retainedCorpses={}
+ M.current=nil;_G.__NATIVE_TRAINING_MONSTER=nil;S.activeMonster=nil;S.monsters={};S.roomReady=false
+ set('idle','Current managed encounter cleared; player inventory retained')
+end
+local function clearRoomMonsters(world)
+ local count=0
+ for _,o in ipairs(FindAllOf('DCMonsterBase')or{})do
+  if T.valid(o)then
+   local ow=T.world(o)
+   if T.valid(ow)and ow:GetAddress()==world:GetAddress()then
+    local ok,e=pcall(Life.clear,o)
+    if ok then count=count+1 else log('boss_room_clear_failed '..tostring(e))end
+   end
+  end
+ end
+ log('boss_room_clear count='..count)
+end
+function M.enterRoom(moduleId)
+ assert(_G.__AI_PAUSED==true,'Custom AI must remain disabled')
+ assert(not S.deathFailure,'Previous original death failure requires a fresh isolated process')
+ assert(S.gameInfoFallbackInstalled,'Existing process runtime dependency required')
+ local pc=require('UEHelpers').GetPlayerController();local world=T.world(pc)
+ assert(T.valid(world)and T.valid(world.GameState)and S.gameInfoFallbackState==world.GameState:GetAddress(),'GameInfo fallback must be bound to the current offline world')
+ assert(not M.pending,'A selection is already in progress; wait or clear it first')
+ M.clear()
+ local scene=Scenes.requestRoom(moduleId)
+ M.generation=M.generation+1
+ local request={generation=M.generation,room=moduleId,started=os.time(),mode='room',roomOnly=true,previous=M.current,world=T.identity(world),scene=scene}
+ M.pending=request;S.spawnStage='boss-room';S.nextStage=math.huge;S.roomReady=false;S.sceneMode='room'
+ S.action='Loading boss room '..tostring(scene.module.name or moduleId)
+ set('loading_scene',S.action)
+ return request
+end
+function M.select(key,options)
+ assert(_G.__AI_PAUSED==true,'Custom AI must remain disabled')
+ assert(not S.deathFailure,'Previous original death failure requires a fresh isolated process')
+ assert(S.gameInfoFallbackInstalled,'Existing process runtime dependency required')
+ local pc=require('UEHelpers').GetPlayerController();local world=T.world(pc)
+ assert(T.valid(world)and T.valid(world.GameState)and S.gameInfoFallbackState==world.GameState:GetAddress(),'GameInfo fallback must be bound to the current offline world')
+ local r=C.resolve(key);options=options or{}
+ assert(not M.pending,'A selection is already in progress; wait or clear it first')
+ local mode=options.mode or S.sceneMode or'current'
+ assert(mode=='current'or mode=='original'or mode=='room','Unknown scene mode')
+ local scene
+ if mode=='room'then
+  assert(M.current and M.current.mode=='room'and M.current.scene,'Enter a boss room first')
+  scene=M.current.scene
+ else scene=Scenes.request(r,options.module,mode)end
+ M.generation=M.generation+1
+ local request={generation=M.generation,record=r,started=os.time(),options=options,previous=M.current,world=T.identity(world)}
+ if mode=='current'then request.entry=Positions.snapshot(pc.Pawn)end
+ M.pending=request;S.spawnStage='unified-switch';S.nextStage=math.huge
+ S.selectedMonster=r.id;S.victoryAt=nil
+ request.scene=scene;request.mode=mode
+ set('loading_scene',(mode=='current'and'Keeping player here; preparing 'or mode=='room'and'Preparing selected monster in boss room 'or'Loading original scene for ')..r.name)
+ return request
+end
+function M.refresh()
+ assert(M.current and M.current.record,'Select a catalog record before refresh')
+ return M.select(M.current.record.id,{refresh=true,mode=M.current.mode or'current'})
+end
+function M.canResetPositions(player)
+ if M.pending then return false end
+ return Positions.plan(player,M.current,Life)~=nil
+end
+function M.resetPositions()
+ assert(not M.pending,'Wait for current training initialization')
+ local player=require('UEHelpers').GetPlayerController().Pawn
+ local result=Positions.reset(player,M.current,Life)
+ S.uiPositionReset=result;S.action='Recorded training positions restored; monsters='..result.monsters
+ log('position_reset '..S.action);return result
+end
+function M.tick()
+ local p=M.pending;if not p then return end
+ if p.generation~=M.generation then return end
+ local ok,e=pcall(function()
+  if os.time()-p.started>120 then error('Unified switch timeout; original dependency not satisfied')end
+  local pc=require('UEHelpers').GetPlayerController()
+  assert(T.valid(T.world(pc))and T.identity(T.world(pc))==p.world,'World changed during selection; cancelling stale request')
+  if p.mode~='current'and not Scenes.poll(p.scene)then return end
+  if p.mode=='room'and p.roomOnly and not p.actor then
+   local player=pc.Pawn
+   local point=Scenes.roomPoint(p.scene)
+   assert(point,'Boss room has no PlayerStart or boss spawn anchor; refusing to leave player in another room')
+   assert(player:K2_SetActorLocation(point,false,{},true),'Boss room player placement failed')
+   local context=Scenes.positionContext(p.scene)
+   Positions.captureEntry(player,context,'boss-room-entry')
+   clearRoomMonsters(T.world(pc))
+   M.current={mode='room',room=p.room,scene=p.scene,positionContext=context}
+   S.activeMonster=nil;S.monsters={};S.spawnStage=nil;S.roomReady=(p.mode=='room');M.pending=nil
+   if Scenes.activate then Scenes.activate(p.scene)end
+   set('room_ready','Boss room loaded; no boss spawned; select monsters to spawn')
+   Scenes.trim(p.scene.id,3)
+   return
+  end
+  if not p.actor then
+   local actor,source=Scenes.spawn(p.record,p.scene,p.previous and p.previous.actor)
+   p.actor=actor
+   if p.mode=='current'then local at=pc.Pawn:K2_GetActorLocation();p.scene.anchorActor=actor;p.scene.anchorPoint={X=at.X,Y=at.Y,Z=at.Z}end
+   p.source=source
+   if p.mode~='current'then Positions.captureMonster(actor)end
+   set('preparing_scene','Original '..p.record.name..' created; checking scene before original initialization')
+   return
+  end
+  if p.mode=='current'and not Scenes.poll(p.scene)then return end
+  if(p.mode=='current'or p.mode=='room')and not p.placed then
+   local point=Scenes.placeCurrent(p.actor,p.scene)
+   Positions.captureMonster(p.actor)
+   p.placed=true;log(string.format('placement mode=%s actor=%.3f,%.3f,%.3f fixed_forward=true player_moved=false',p.mode,point.X,point.Y,point.Z))
+  end
+  if not p.adopted then
+   local ready,why=Scenes.prepare(p.actor,p.scene,p)
+   if not ready then
+    if p.lastPreparation~=why then p.lastPreparation=why;set('preparing_scene',why)end
+    return
+   end
+   if p.navigationAttempted then log('navigation_prepare_best_effort '..tostring(p.navigationDiagnostic or'native setup requested; no suitability verdict'))end
+   Life.adopt(p.actor);p.adopted=true
+   set('initializing','Original '..p.record.name..' scene prepared; shared lifecycle: '..p.source)
+   return
+  end
+  local phase,why=Life.status(p.actor)
+  if phase=='blocked'or phase=='removed'then error('Original lifecycle '..phase..': '..tostring(why))end
+  if phase~='ready'and phase~='corpse'then return end
+  assert(phase~='corpse','Selected original actor died before switch completed')
+  local player=pc.Pawn
+  local point=p.mode=='original'and Scenes.playerPoint(p.actor,p.scene)or nil
+  if point then assert(player:K2_SetActorLocation(point,false,{},true),'Original scene player placement failed')end
+  local context=Scenes.positionContext(p.scene)
+  Positions.captureEntry(player,context,p.mode=='original'and'scene-entry'or p.mode=='room'and'boss-room-spawn'or'training-start',p.mode=='current'and p.entry or nil)
+  M.current={actor=p.actor,record=p.record,scene=p.scene,mode=p.mode,room=p.room,positionContext=context}
+  _G.__NATIVE_TRAINING_MONSTER=p.actor;S.activeMonster=p.record.id;S.monsters={p.actor};S.spawnStage=nil;S.roomReady=(p.mode=='room');M.pending=nil
+  p.committed=true
+  if Scenes.activate then Scenes.activate(p.scene)end
+  if p.previous and T.valid(p.previous.actor)and p.previous.actor:GetAddress()~=p.actor:GetAddress()then
+   local hp=T.health(p.previous.actor)
+   if hp and hp<=0 then M.retainedCorpses[#M.retainedCorpses+1]=p.previous.actor;log('retained_corpse '..T.identity(p.previous.actor))
+   else Life.clear(p.previous.actor)end
+  end
+  set('ready',p.record.name..(p.mode=='current'and' ready nearby; player not moved' or p.mode=='room'and' ready in boss room' or' ready in original scene')..'; full gameplay UNVERIFIED')
+  Scenes.trim(p.scene.id,3)
+ end)
+ if not ok then
+  if p.committed then set('ready_with_warning','Selected encounter retained; post-switch cleanup needs attention: '..tostring(e));return end
+  local restored,restoreError=pcall(Scenes.cancelPreparation,p);if not restored then log('navigation_restore_failed '..tostring(restoreError))end
+  if T.valid(p.actor)and(not p.previous or not T.valid(p.previous.actor)or p.actor:GetAddress()~=p.previous.actor:GetAddress())then
+   local cleaned,why=pcall(Life.clear,p.actor);if not cleaned then log('cleanup_failed '..tostring(why))end
+  end
+  M.pending=nil;S.spawnStage=nil;set('blocked',tostring(e))
+ end
+end
+M.timer=Q.loop(250,function()M.tick();return false end)
+_G.__DARKERLAB_SWITCHBOARD=M
+return M
+
+end
+local Switchboard=make_Switchboard()
+return {runtime=Runtime, switchboard=Switchboard}

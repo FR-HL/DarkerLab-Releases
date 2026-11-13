@@ -1,0 +1,175 @@
+-- Native class-row writer for the 0.18.160 V2 layout.
+-- The class arrays are TArray<TSoftObjectPtr>, not TArray<FPrimaryAssetId>.
+-- Direct element assignment crashes UE4SS; ImportText with the soft object
+-- path works:
+--   ((/Game/DungeonCrawler/Data/Generated/V2/Perk/Perk/Id_Perk_X.Id_Perk_X))
+-- Perks and skills are written here; spells/musics keep the original defaults
+-- until their ten-slot physical mapping is verified.
+local M = {}
+
+local CLASS_NAMES = {'Wizard','Rogue','Ranger','Fighter','Cleric','Barbarian','Bard','Warlock','Druid','Sorcerer'}
+local V2 = '/Game/DungeonCrawler/Data/Generated/V2/'
+local CATEGORIES = {
+  perk  = {field='Perks',  prefix='DesignDataPerk',  limit=4,  soft=V2..'Perk/Perk/'},
+  skill = {field='Skills', prefix='DesignDataSkill', limit=2,  soft=V2..'Skill/Skill/'},
+  spell = {field='Spells', prefix='DesignDataSpell', limit=10, soft=V2..'Spell/Spell/'},
+  music = {field='Musics', prefix='DesignDataMusic', limit=10, soft=V2..'Music/Music/'},
+}
+local ORDER = {'perk','skill','spell','music'}
+local LEGACY_BASE = '/Game/DungeonCrawler/Data/Generated/DT_PlayerCharacter/PlayerCharacter/'
+local V2_BASE = '/Game/DungeonCrawler/Data/Generated/V2/PlayerCharacter/PlayerCharacter/'
+local SPELL_BANKS = {Id_Skill_SpellMemory1=true,Id_Skill_SpellMemory2=true,Id_Skill_Sorcery1=true,Id_Skill_Sorcery2=true}
+local MUSIC_BANKS = {Id_Skill_MusicMemory1=true,Id_Skill_MusicMemory2=true}
+
+local DRAFT = _G.__DARKERLAB_NATIVE_LOADOUT or {}
+_G.__DARKERLAB_NATIVE_LOADOUT = DRAFT
+
+local function read(fn)
+  local ok, value = pcall(fn)
+  if ok then return value end
+end
+local function valid(object)
+  return read(function() return object and object:IsValid() end) == true
+end
+local function text(value)
+  return read(function() return value:ToString() end)
+end
+local function log(message)
+  print('[NATIVE-LOADOUT] ' .. tostring(message))
+end
+local function nativeId(index)
+  return 'Id_PlayerCharacter_' .. assert(CLASS_NAMES[index], 'unknown class index: ' .. tostring(index))
+end
+local function rowAsset(id)
+  for _, base in ipairs({V2_BASE, LEGACY_BASE}) do
+    local path = base .. id .. '.' .. id
+    local object = read(function() return StaticFindObject(path) end)
+    if not valid(object) then
+      local ok, loaded = pcall(LoadAsset, path)
+      if ok then object = loaded end
+    end
+    if valid(object) and read(function() return object.Perks ~= nil end) == true then
+      return object, path
+    end
+  end
+end
+local function arrayField(row, key)
+  local field = CATEGORIES[key].field
+  local array = read(function() return row[field] end)
+  if array == nil then array = read(function() return row.Item and row.Item[field] end) end
+  return array
+end
+local function names(array)
+  local out = {}
+  local count = read(function() return #array end) or 0
+  for index = 1, count do
+    local raw = array[index]
+    local entry = read(function() return raw:get() end) or raw
+    local name = entry and text(entry.PrimaryAssetName) or nil
+    out[index] = (not name or name == 'None') and '' or name
+  end
+  return out
+end
+local function readArray(row, key)
+  return names(arrayField(row, key))
+end
+local function propertyFor(row, key)
+  local field = CATEGORIES[key].field
+  local prop
+  row:GetClass():ForEachProperty(function(candidate)
+    if candidate:GetFName():ToString() == field then prop = candidate end
+  end)
+  return prop
+end
+local function writeSoftArray(row, key, ids)
+  local prop = propertyFor(row, key)
+  assert(prop, 'class row property missing: ' .. key)
+  local inner = prop:GetInner()
+  assert(inner, 'class row inner property missing: ' .. key)
+  local kind = inner:GetClass():GetFName():ToString()
+  if kind ~= 'SoftObjectProperty' then
+    return false, 0, 'inner=' .. tostring(kind)
+  end
+  local entries = {}
+  for _, id in ipairs(ids) do
+    entries[#entries + 1] = id == '' and '' or (CATEGORIES[key].soft .. id .. '.' .. id)
+  end
+  if #entries == 0 then return true, 0 end
+  local pointer = prop:ContainerPtrToValuePtr(row, 0)
+  local ok, failure = pcall(function()
+    prop:ImportText('(' .. table.concat(entries, ',') .. ')', pointer, 0, row)
+  end)
+  if not ok then return false, 0, tostring(failure) end
+  local count = read(function() return #arrayField(row, key) end) or 0
+  return true, count
+end
+
+function M.setCategory(index, key, ids)
+  assert(CLASS_NAMES[index], 'unknown class index: ' .. tostring(index))
+  local category = assert(CATEGORIES[key], 'unsupported native category: ' .. tostring(key))
+  assert(type(ids) == 'table', 'loadout ids must be a table')
+  assert(#ids <= category.limit, 'too many ' .. key .. ' ids: ' .. #ids .. ' > ' .. category.limit)
+  local entry = DRAFT[index] or {}
+  entry[key] = ids
+  DRAFT[index] = entry
+  return entry
+end
+
+function M.apply(index)
+  local entry = DRAFT[index]
+  if not entry then return {applied=false, reason='no_draft'} end
+  local id = nativeId(index)
+  local row, path = rowAsset(id)
+  assert(valid(row), 'native class row missing: ' .. id)
+  local report = {applied=true, class=id, path=path, categories={}}
+  for _, key in ipairs(ORDER) do
+    local ids = entry[key]
+    if ids and #ids > 0 then
+      local ok, count, failure = writeSoftArray(row, key, ids)
+      if not ok then error('soft write failed for ' .. key .. ': ' .. tostring(failure), 0) end
+      report.categories[key] = count
+    end
+  end
+  log('applied ' .. id .. ' ' .. tostring(path) .. ' ' .. tostring(report.categories.perk or 0) .. '/' .. tostring(report.categories.skill or 0))
+  return report
+end
+
+function M.capture(index)
+  local id = nativeId(index)
+  local row, path = rowAsset(id)
+  local result = {class=id, path=path, draft=DRAFT[index], row={}}
+  if valid(row) then
+    for _, key in ipairs(ORDER) do
+      result.row[key] = readArray(row, key)
+    end
+  end
+  return result
+end
+
+function M.spellBankEnabled(index)
+  local entry = DRAFT[index]
+  local skills = entry and entry.skill
+  if not skills then
+    local row = rowAsset(nativeId(index))
+    skills = valid(row) and readArray(row, 'skill') or {}
+  end
+  for _, id in ipairs(skills) do
+    if SPELL_BANKS[id] then return true end
+  end
+  return false
+end
+
+function M.musicBankEnabled(index)
+  local entry = DRAFT[index]
+  local skills = entry and entry.skill
+  if not skills then
+    local row = rowAsset(nativeId(index))
+    skills = valid(row) and readArray(row, 'skill') or {}
+  end
+  for _, id in ipairs(skills) do
+    if MUSIC_BANKS[id] then return true end
+  end
+  return false
+end
+
+return M

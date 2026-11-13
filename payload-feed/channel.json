@@ -1,0 +1,8 @@
+{
+    "schema":  1,
+    "version":  "0.3.10",
+    "minLauncher":  "0.3.10",
+    "manifest":  "manifests/0.3.10.json",
+    "manifestSha256":  "23b1bc743138567188b5a2dbfed44ef96ee0fa93feabc383f80fcef8758c144c",
+    "signature":  "cdm16tZpfcIi/6vLF9lXdlwX+hvAnA0QCRnBi9g1qXoAWP1scyUWINPvYpPc8KF056/cbNvXO/RHXUaMePK+aSH2EU71MIq1GeFSzVB+RXHgouVoMirBzkY4tjgK8wHbFy7MnhC4OVJbWLS9gEjO0e6Q/g5ZUWXTvYR6PtGWXByBDIoAO/KOHkZe5rfcfBD25kkYF0pWpmg95FVlUvLg5fws1mfuDEem5OF2FQuE4I4T6stnNpPkPazTYjBrD5RV/gFwFEgaPT1J2zCOygPryEF6xhnRjNhqzKxiAF1JBcE5I7AQ7bqLAaoGRJh3FNALYdVRKF4ouGJ6vopAq1eENIXGAy4cMjPo9/oyMAs4qVNoEe5ptyx+PuMl9lPpHWwSA8jMu/9aghVQ1E/tS1LfOUUmmAhWCKC648lkLOvvXRIOybTm+ZO8OQy8IRkvS6RncCbpbRz9089lnhRyUwI5FxBms80+UoiflpOWujD1bYrXENAztSFeGHIpG8QVHj/h"
+}

@@ -1,0 +1,192 @@
+-- Domain module. Generated from the old single-purpose Lua modules.
+local ROOT=assert(os.getenv('DARKERLAB_ROOT'),'DARKERLAB_ROOT is not set')
+local MOD=_G.__DARKERLAB_MOD_DIR or (ROOT..'/game/'..(os.getenv('DARKERLAB_GAME_COPY') or 'Dark and Darker-NoAC')..'/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/scripts/')
+local function loadDomain(name)
+ local cache=_G.__DARKERLAB_DOMAIN_CACHE or {};_G.__DARKERLAB_DOMAIN_CACHE=cache
+ if not cache[name] then cache[name]=dofile(MOD..name..'.lua') end
+ return cache[name]
+end
+local Core=loadDomain('core')
+local function make_UIModel()
+local ROOT=assert(os.getenv('DARKERLAB_ROOT'),'DARKERLAB_ROOT is not set')
+-- Presentation only: no Unreal calls, gameplay writes or encounter selection.
+local U={}
+local BUILD=assert(os.getenv('DARKERLAB_GAME_BUILD'),'DARKERLAB_GAME_BUILD is not set')
+local loaded,data=pcall(dofile,ROOT..'/src/build/cache/catalog/profiles/'..BUILD..'/ui-data.lua')
+U.data=loaded and data or{classes={},items={},monsters={}}
+local function clean(value)return tostring(value or''):gsub('[\t\r\n]',' ')end
+local terms=U.data.terms or{}
+local short={["次级首领怪物"]="次级首领",["首领怪物"]="首领",["普通怪物"]="普通",["普通级别"]="普通",["精锐级别"]="精英",["梦魇级别"]="噩梦",["Type.Monster.Class.Boss"]="首领",["Type.Monster.Class.SubBoss"]="次级首领",["Type.Monster.Class.Normal"]="普通",["Type.Monster.Grade.Common"]="普通",["Type.Monster.Grade.Elite"]="精英",["Type.Monster.Grade.Nightmare"]="噩梦"}
+local function term(value)
+ local text=terms[value]or value
+ return short[text]or text
+end
+function U.monsterType(value)
+ value=tostring(value or'');return value,term(value)
+end
+function U.grade(value)
+ value=tostring(value or'');return value,term(value)
+end
+function U.writeMonsters(catalog)
+ local ids={};for id in pairs(catalog.records)do ids[#ids+1]=id end;table.sort(ids)
+ local out={'DARKERLAB_MONSTERS_V2'}
+ for _,id in ipairs(ids)do
+  local r=catalog.records[id];local native=U.data.monsters and U.data.monsters[id];local name=native and native.name or r.name;local _,kind=U.monsterType(r.class_type);local _,grade=U.grade(r.grade)
+  local scene=r.modules and r.modules[1]and catalog.modules[r.modules[1]]
+  local sceneName=scene and tostring(scene.name):gsub('（Text_.-）$','')or''
+  out[#out+1]=table.concat({clean(id),clean(name),kind,grade,scene and'1'or'0',clean(sceneName),name~=id and'1'or'0'},'\t')
+ end
+ return table.concat(out,'\n')..'\n',#ids
+end
+local function rowsText(header,rows)
+ local out={header}
+ for _,row in ipairs(rows)do local values={};for i,v in ipairs(row)do values[i]=clean(v)end;out[#out+1]=table.concat(values,'\t')end
+ return table.concat(out,'\n')..'\n',#rows
+end
+function U.writeClasses(keys)
+ local rows={};for i,key in ipairs(keys)do local id='Id_PlayerCharacter_'..key;local r=U.data.classes[id];rows[#rows+1]={id,r and r.name or id,tostring(i),r and r.name~=id and'1'or'0'}end
+ return rowsText('DARKERLAB_CLASSES_V2',rows)
+end
+function U.writeItems(names)
+ local ids,seen={},{};for id in pairs(U.data.items or{})do ids[#ids+1]=id;seen[id]=true end
+ for _,id in ipairs(names or{})do if not seen[id]then ids[#ids+1]=id end end
+ table.sort(ids,function(a,b)local ar=U.data.items[a]or{};local br=U.data.items[b]or{};if tostring(ar.name)~=tostring(br.name)then return tostring(ar.name)<tostring(br.name)end;if tostring(ar.rarity)~=tostring(br.rarity)then return tostring(ar.rarity)<tostring(br.rarity)end;return a<b end)
+ local rows={};for _,id in ipairs(ids)do local r=U.data.items[id];local rarity=r and r.rarity or'';rows[#rows+1]={id,r and r.name or id,r and r.properties and r.properties.ItemType or'',r and r.name~=id and'1'or'0',rarity,r and r.variant_family or id,tostring(r and r.secondary_pool_count or 0),U.data.rarity_names and U.data.rarity_names[rarity]or rarity,r and r.slot_type or'',table.concat(r and r.secondary_pool_ids or{},'|')}end
+ return rowsText('DARKERLAB_ITEMS_V2',rows)
+end
+function U.writePropertyPools()
+ local ids={};for id in pairs(U.data.property_pools or{})do ids[#ids+1]=id end;table.sort(ids)
+ local rows={}
+ for _,id in ipairs(ids)do local pool=U.data.property_pools[id]
+  for _,entry in ipairs(pool.entries or{})do local p=entry.property or{}
+   rows[#rows+1]={id,p.property_id or'',p.name_cn or'',p.minimum_raw or'',p.maximum_raw or''}
+  end
+ end
+ return rowsText('DARKERLAB_POOLS_V2',rows)
+end
+function U.friendlyError(raw)
+ raw=tostring(raw or'')
+ local rules={
+  {'No walkable','附近没有合适落点','请稍微移动到开阔位置后重试；不会自动传送。'},
+  {'navigation','场地导航尚未准备好','本轮没有完成切换，查看高级信息了解详情。'},
+  {'Navigation','场地导航尚未准备好','本轮没有完成切换，查看高级信息了解详情。'},
+  {'not mapped','暂无对应原版场地','请选择“原地刷新怪物”进行训练。'},
+  {'already in progress','正在准备上一轮','请等待当前操作完成。'},
+  {'World changed','房间已变化','上一次准备已取消，请重新选择训练。'},
+  {'GameInfo','会话依赖尚未就绪','请等待训练房间加载完成。'},
+  {'death failure','需要重新启动','上次原版死亡流程异常，请保留日志并重新启动离线副本。'},
+  {'loadout','配装暂不可恢复','请先为当前职业保存一套配装。'},
+  {'before refresh','尚无可重开的训练','先选择目标并点击开始训练。'},
+  {'Attribute value','基础属性值无效','七项属性都必须是 1–99 的整数。'},
+  {'Attribute','基础属性未应用','初始化效果写入或重载核对失败；当前轮次未确认生效。'},
+ }
+ for _,r in ipairs(rules)do if raw:find(r[1],1,true)then return r[2],r[3]end end
+ return'操作未完成','现场与详细原因保留在“训练设置 → 高级信息”中。'
+end
+local trainingKinds={['switch-scene']=true,['boss-room']=true,spawn=true,switch=true,reset=true}
+function U.beginCommand(state,raw)
+ state.uiSequence=(state.uiSequence or 0)+1;state.uiError=nil
+ local kind=raw:match('^(%S+)')or raw
+ local r={id=state.uiSequence,kind=kind,status='running',raw=raw};state.uiResult=r;return r
+end
+function U.trainingPhase(state,phase,raw,generation)
+ state.uiTrainingPhase=phase;state.uiTrainingRaw=raw
+ if phase=='loading_scene'then
+  local r=state.uiResult
+  if not r or not trainingKinds[r.kind]then r=U.beginCommand(state,'switch')end
+  r.generation=generation;r.status='pending';return
+ end
+ if phase=='room_ready'then
+  local r=state.uiResult
+  if r and r.kind=='boss-room'then r.status='ok';r.title='Boss 房已载入';r.detail='房间内没有生成 Boss；选择怪物后逐只生成。' end
+ end
+ if phase=='ready'or phase=='ready_with_warning'or phase=='blocked'then
+  local r=U.beginCommand(state,'switch');r.generation=generation;r.status=phase=='blocked'and'error'or'ok';r.error=phase=='blocked'and raw or nil
+  r.title=phase=='blocked'and'训练未开始'or'训练对象已生成';r.detail=phase=='blocked'and select(2,U.friendlyError(raw))or'重置位置可让玩家与当前训练怪回到初始位置。'
+  if phase=='blocked'then local why=U.friendlyError(raw);r.detail=why..'。'..r.detail end
+ end
+end
+function U.finishCommand(state,board,r,ok,error)
+ if state.uiResult~=r then return end
+ if not ok then r.status='error';r.error=tostring(error);r.title,r.detail=U.friendlyError(error);state.uiError=tostring(error);return end
+ if trainingKinds[r.kind]then r.status=board.pending and'pending'or'ok';return end
+ r.status='ok'
+ if r.kind=='speed'then
+  local who,pv,mv=r.raw:match('^speed%s+(%a+)%s+([%d%.]+)%s*([%d%.]*)$')
+  r.title='速度已设置'
+  if who=='both'and mv~=''then r.detail='玩家 '..pv..'，怪物 '..mv..'（1.0 为正常速度）。'
+  else r.detail=r.raw:gsub('^speed%s*','')..'（1.0 为正常速度）。'end
+ elseif r.kind=='ability'then r.title='能力已处理';r.detail=state.action or r.raw
+ elseif r.kind=='guard'then r.title=state.guard and'无敌免伤已开启'or'无敌免伤已关闭';r.detail='已核对原版免伤状态。'
+ elseif r.kind=='autoheal'then r.title=state.autoHeal and'自动回复已开启'or'自动回复已关闭';r.detail='开启后每秒恢复 50 点生命。'
+ elseif r.kind=='clear'then r.title='训练怪与尸体已清理';r.detail='玩家背包保留。请选择目标后点击开始训练。'
+ elseif r.kind=='reset-position'then r.title='位置已重置';r.detail=string.format('玩家与本组 %d 只训练怪已回位；血量和装备不变。',state.uiPositionReset and state.uiPositionReset.monsters or 0)
+ elseif r.kind=='save-loadout'then r.title='配装已保存';r.detail='已保存当前职业的配装。'
+ elseif r.kind=='restore-loadout'then r.title='配装已放入背包';r.detail='已把保存记录中的缺失物品放入背包。'
+ elseif r.kind=='reset-character'then r.title='角色状态已重置';r.detail='已清除临时技能、效果、冷却和动作锁；职业、装备、位置与怪物不变。'
+ elseif r.kind=='attributes'then
+  if r.raw:find('attributes reset',1,true)then r.title='默认属性已写入';r.detail='正在重载本轮；重载后自动核对七项基础值。'
+  else r.title='基础属性已写入';r.detail='正在重载本轮；重载后自动核对七项基础值。'end
+ elseif r.kind=='equip'then r.title='已放入背包';r.detail='请到原版背包手动穿戴。'
+ elseif r.kind=='item'then r.title='物品已加入背包';r.detail='原版库存操作已完成。'
+ elseif r.kind=='repeat'then r.title=state.repeatTraining and'无限训练模式已开启'or'无限训练模式已关闭';r.detail=''
+ elseif r.kind=='snapshot'then r.title='诊断快照已保存';r.detail='快照保存在本地输出目录。'
+ elseif r.kind=='scene'then r.title='下次训练的场地已选择';r.detail=state.sceneMode=='original'and'开始训练时准备对应BOSS房间。'or'开始训练时在原地刷新怪物。'
+ elseif r.kind=='room'or r.kind=='class'then r.status='pending';r.title='正在载入训练房间';r.detail='请等待角色与房间准备完成。'
+ else r.title='操作已完成';r.detail=''
+ end
+end
+function U.present(state,board)
+ board=board or{};local phase=board.phase or'idle'
+ local result=state.uiResult
+ if result and result.status=='pending'and(result.kind=='room'or result.kind=='class')and state.hasPlayer and(not state.travelUntil or os.time()>=state.travelUntil)then result.status='ok';result.title='训练房间已载入';result.detail='角色已准备完成。'end
+ local busy=board.pending~=nil or(result and result.status=='pending'and(result.kind=='room'or result.kind=='class'))or false
+ local attributePending=state.attributePending~=nil
+ busy=busy or attributePending
+ local p={phase=phase,busy=busy,title='请选择训练目标',detail='选择怪物与场地后，点击开始训练。'}
+ if not state.hasPlayer then p.title='训练状态';p.detail='选择目标后点击“进入训练房间”。'
+ elseif state.deathFailure then p.title='需要重新启动';p.detail='上次原版死亡流程异常，当前训练已停止。'
+ elseif state.uiError then p.title,p.detail=U.friendlyError(state.uiError)
+ elseif phase=='blocked'then p.title,p.detail=U.friendlyError(state.action)
+ elseif attributePending then p.title='正在重载本轮';p.detail='重载后自动核对七项基础值。'
+ elseif busy then
+  local titles={loading_scene='正在准备场地',preparing_scene='正在准备原版运行环境',initializing='正在准备原版怪物'}
+  p.title=titles[phase]or'正在准备训练';p.detail='请稍候，准备完成后会显示可训练状态。'
+ elseif phase=='ready'or phase=='ready_with_warning'or(phase=='adopted'and board.current)then p.title='可以开始训练';p.detail='训练对象已准备好；具体机制仍以实测为准。'
+ end
+ if not busy and not state.uiError and phase~='blocked'then
+  local raw=tostring(state.action or'')
+  local confirmations={{'Saved original','当前职业配装已保存。'},{'Added to bag','已放入背包，请手动穿戴。'},{'Added to original bag','所选物品已添加到背包。'},{'Debug snapshot saved','诊断快照已保存。'},{'Heal:','生命已恢复。'},{'loadout restored','已把保存的配装放入背包。'},{'already matches','当前配装与保存记录一致。'}}
+  for _,r in ipairs(confirmations)do if raw:find(r[1],1,true)then p.detail=r[2];break end end
+ end
+ if result and result.status=='ok'and result.title then p.title=result.title;p.detail=result.detail or'';if board.pending then p.detail=p.detail..' 训练仍在准备中。'end
+ elseif result and result.status=='error'then p.title=result.title or'操作未完成';p.detail=result.detail or select(2,U.friendlyError(result.error))end
+ p.canStart=state.hasPlayer==true and not busy and not state.deathFailure and not attributePending and state.gameInfoFallbackInstalled==true and (state.sceneMode~='room'or state.roomReady==true)
+ p.canReset=p.canStart and board.current~=nil and board.current.record~=nil
+ p.canClear=state.hasPlayer==true and(board.current~=nil or board.pending~=nil or #(board.retainedCorpses or{})>0)
+ p.canResetPosition=state.hasPlayer==true and not busy and state.uiCanResetPosition==true
+ p.hp=tonumber(state.uiHp)or 0;p.maxHp=tonumber(state.uiMaxHp)or 0
+ p.monsterHp=tonumber(state.uiMonsterHp)or 0;p.monsterMaxHp=tonumber(state.uiMonsterMaxHp)or 0
+ return p
+end
+function U.stateTable(state,board,record,classIndex,classKey)
+ local p=U.present(state,board)
+ local current=board and board.current
+ local active=current and current.record;local native=active and U.data.monsters and U.data.monsters[active.id]
+ local shownClass=tonumber(state.uiActualClass)or tonumber(classIndex)or 4
+ local shownClassKey=U.data.classes['Id_PlayerCharacter_'..tostring(shownClass)]and tostring(shownClass)or tostring(classKey or shownClass)
+ local attributeText=''
+ if type(state.attributeValues)=='table'then local parts={};for i,v in ipairs(state.attributeValues)do parts[i]=string.format('%g',tonumber(v)or 0)end;attributeText=table.concat(parts,',')end
+ local values={schema='2',visible=state.visible and'1'or'0',has_player=state.hasPlayer and'1'or'0',busy=p.busy and'1'or'0',can_start=p.canStart and'1'or'0',
+  status_title=p.title,status_detail=p.detail,can_reset=p.canReset and'1'or'0',can_reset_position=p.canResetPosition and'1'or'0',can_clear=p.canClear and'1'or'0',command_id=state.uiResult and tostring(state.uiResult.id)or'0',command_status=state.uiResult and state.uiResult.status or'',command_kind=state.uiResult and state.uiResult.kind or'',hp=string.format('%.1f',p.hp),max_hp=string.format('%.1f',p.maxHp),monster_hp=string.format('%.1f',p.monsterHp),monster_max_hp=string.format('%.1f',p.monsterMaxHp),guard=state.guard and'1'or'0',repeat_training=state.repeatTraining and'1'or'0',auto_heal=state.autoHeal and'1'or'0',infinite_stackables=state.infiniteStackables and'1'or'0',room_ready=state.roomReady and'1'or'0',
+  class_index=tostring(shownClass),class_name=U.data.classes['Id_PlayerCharacter_'..shownClassKey]and U.data.classes['Id_PlayerCharacter_'..shownClassKey].name or('Id_PlayerCharacter_'..shownClassKey),scene_mode=state.sceneMode or'current',monster_id=state.selectedMonster or'',
+  active_name=native and native.name or(active and active.name)or'尚未开始',active_mode=current and current.mode or'',saved_items=tostring(state.loadoutCount or 0),
+  attribute_values=attributeText,attribute_ready=attributeText~=''and'1'or'0',attribute_pending=state.attributePending and'1'or'0',panel_on_menu_keys=state.panelOnMenuKeys and'1'or'0',
+  phase=p.phase,raw_action=state.action or'',raw_training=state.uiTrainingRaw or'',guard_actual=state.uiGuardActual==nil and'unknown'or(state.uiGuardActual and'1'or'0'),raw_sample=state.sample or'',gameinfo=state.gameInfoFallbackInstalled and'1'or'0',death_failure=state.deathFailure and'1'or'0',player_speed=string.format('%.1f',tonumber(state.playerSpeed)or 1),monster_speed=string.format('%.1f',tonumber(state.monsterSpeed)or 1),presets=state.uiPresets or''}
+ return values,p
+end
+return U
+
+end
+local UIModel=make_UIModel()
+return UIModel

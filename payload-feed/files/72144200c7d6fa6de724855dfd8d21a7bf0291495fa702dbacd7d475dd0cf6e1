@@ -1,0 +1,82 @@
+-- In-process bridge to gui.dll. No command/state files.
+local ROOT = assert(os.getenv("DARKERLAB_ROOT"), "DARKERLAB_ROOT is not set")
+local GUI_DLL = ROOT .. "/src/build/output/native/gui.dll"
+local CONTROL_DLL = ROOT .. "/src/build/output/native/control_client.dll"
+local M = { runtime = ROOT .. "/runtime/" }
+
+local function bind(dll, name)
+  local fn, err = package.loadlib(dll, name)
+  if not fn then error("bridge export " .. name .. ": " .. tostring(err)) end
+  return fn
+end
+
+local takeRaw = bind(GUI_DLL, "darkerlab_bridge_take_command")
+local ackRaw = bind(GUI_DLL, "darkerlab_bridge_ack")
+local publishStateRaw = bind(GUI_DLL, "darkerlab_bridge_publish_state")
+local publishModelRaw = bind(GUI_DLL, "darkerlab_bridge_publish_model")
+local lastAckRaw = bind(GUI_DLL, "darkerlab_bridge_last_ack")
+local controlRaw = bind(CONTROL_DLL, "darkerlab_control_request")
+local submitRaw = bind(CONTROL_DLL, "darkerlab_control_submit")
+local pollRaw = bind(CONTROL_DLL, "darkerlab_control_poll")
+
+function M.readAck() return tonumber(lastAckRaw()) or 0 end
+
+function M.take(lastId)
+  local id, text = takeRaw()
+  id = tonumber(id)
+  if not id or not text then return nil end
+  if id <= (lastId or 0) then return nil end
+  return { id = id, text = text }
+end
+
+function M.ack(id, ok, err)
+  ackRaw(id, ok and "ok" or "error", err or "")
+end
+
+function M.publishState(values)
+  publishStateRaw(values)
+end
+
+function M.publishModel(name, text)
+  publishModelRaw(name, text)
+end
+
+function M.request(method, path, body)
+  local status, text = controlRaw(method, path, body or "")
+  if not status then return nil, text end
+  return tonumber(status), text
+end
+
+local pending = {}
+function M.submit(method, path, body, callback)
+  local id = submitRaw(method, path, body or "")
+  id = tonumber(id)
+  if not id then return nil end
+  pending[id] = callback or false
+  return id
+end
+
+function M.poll()
+  for id, callback in pairs(pending) do
+    local state, status, text = pollRaw(id)
+    state = tonumber(state)
+    if state == 1 or state == -1 then
+      pending[id] = nil
+      if callback then
+        if state == 1 then callback(tonumber(status), text)
+        else callback(nil, text) end
+      end
+    end
+  end
+end
+
+function M.wait(seconds, predicate)
+  local deadline = os.clock() + (tonumber(seconds) or 0.25)
+  repeat
+    M.poll()
+    if predicate() then return true end
+  until os.clock() >= deadline
+  return false
+end
+
+return M

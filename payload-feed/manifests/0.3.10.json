@@ -1,0 +1,271 @@
+{
+    "gameExe":  "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/DungeonCrawler.exe",
+    "gameExeSha256":  "32584eeeaf7e5f3ebbde49c17f9cf42f8d1b9a398af3c9234a37bc01c490c2da",
+    "version":  "0.3.10",
+    "payloadHash":  "88e1aab268067a79bd50a207912f8d68b7c5e0acb9e5699e5e7497573c5ad302",
+    "files":  [
+                  {
+                      "path":  "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/dwmapi.dll",
+                      "bytes":  165376,
+                      "sha256":  "15574afd2e14df67eb17c16ad1e7c51065afff74838b6fb340f64b1d6f61f4aa"
+                  },
+                  {
+                      "path":  "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/steam_appid.txt",
+                      "bytes":  7,
+                      "sha256":  "495d368d1d98a08bf663599063075cfc6fc803f7861089c176db3b93e359de2b"
+                  },
+                  {
+                      "path":  "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/Mods/mods.txt",
+                      "bytes":  37,
+                      "sha256":  "48598e5b53508db979ec8a07a7b3ba2b9289a6fa06afa9f24aa81cd666af5e57"
+                  },
+                  {
+                      "path":  "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/Mods/shared/UEHelpers/UEHelpers.lua",
+                      "bytes":  10237,
+                      "sha256":  "7476f02eef0c87bfeab169f2ffe2e704363faeaae4bf9f1bda574b1e34f4a0e9"
+                  },
+                  {
+                      "path":  "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/scripts/abilities.lua",
+                      "bytes":  5299,
+                      "sha256":  "f90a3741153d4e6d48c317b3da54dde7fb05ea1c7543d07a189e617d3d303c86"
+                  },
+                  {
+                      "path":  "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/scripts/build_profile.lua",
+                      "bytes":  165,
+                      "sha256":  "92607a4413486dc0c6dd723fea6bd41fd9de5d72736242b0083908cbbb725cef"
+                  },
+                  {
+                      "path":  "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/scripts/core.lua",
+                      "bytes":  7047,
+                      "sha256":  "9c346eef8cd9e8ac9429f35eeb159275fd8be9e67a278185c1fc8f9d84e4c926"
+                  },
+                  {
+                      "path":  "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/scripts/encounter.lua",
+                      "bytes":  13002,
+                      "sha256":  "f7c63dfb69b913d13eb4bf8ada5d4a4c5423fb7acd7ba58efa7619b2af3e1003"
+                  },
+                  {
+                      "path":  "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/scripts/main.lua",
+                      "bytes":  4271,
+                      "sha256":  "9d1175930b3e3fcf931272b39c121b38a320d6e4ea6ebeb0815795a9e09a8c1e"
+                  },
+                  {
+                      "path":  "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/scripts/main_bootstrap.lua",
+                      "bytes":  1468,
+                      "sha256":  "3e2078b315253a25be93274dee36adbcd909e3f4ba17100040a89475d4fca395"
+                  },
+                  {
+                      "path":  "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/scripts/monster.lua",
+                      "bytes":  19923,
+                      "sha256":  "ddd0e8ee2c5ff38a224287d892f049dfc4bdd7cd22246aa88eebf2b6e930fb84"
+                  },
+                  {
+                      "path":  "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/scripts/native_druid_lifecycle.lua",
+                      "bytes":  38952,
+                      "sha256":  "0051c2333f3c8447ece82198ee1caf9cf009752c675f3ab8f49a982b873b6a2d"
+                  },
+                  {
+                      "path":  "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/scripts/native_loadout.lua",
+                      "bytes":  6652,
+                      "sha256":  "0576fae7df237d89185657f41d3ba4a11d63255bbfe860f14c67e8af6fd1c42c"
+                  },
+                  {
+                      "path":  "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/scripts/native_shape_memory.lua",
+                      "bytes":  7403,
+                      "sha256":  "ccbe369b92ca2e7280c3a5789094e17d33701efc4b971735dc9147fe767e0d90"
+                  },
+                  {
+                      "path":  "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/scripts/panel.lua",
+                      "bytes":  50143,
+                      "sha256":  "722c5cc150f88595759e14bac3c6b819e8fb92977e758049dd029a76386dc50f"
+                  },
+                  {
+                      "path":  "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/scripts/panel_commands.lua",
+                      "bytes":  1046,
+                      "sha256":  "065a219e9c6a99774ad3e7233f5ee7c35cbed0ed1208bb48f736defb2e2b56c2"
+                  },
+                  {
+                      "path":  "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/scripts/panel_hotkeys.lua",
+                      "bytes":  373,
+                      "sha256":  "cc0bd7c5507df707bac1dcc3c89f2e0a14431dee357b0589242ca11a412787b5"
+                  },
+                  {
+                      "path":  "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/scripts/panel_recovery.lua",
+                      "bytes":  7403,
+                      "sha256":  "7ad25a2844719fef39e3c40feb5c9b3118390ba188bca5b45f6714309c1f105e"
+                  },
+                  {
+                      "path":  "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/scripts/panel_runtime.lua",
+                      "bytes":  2430,
+                      "sha256":  "72144200c7d6fa6de724855dfd8d21a7bf0291495fa702dbacd7d475dd0cf6e1"
+                  },
+                  {
+                      "path":  "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/scripts/panel_view.lua",
+                      "bytes":  16137,
+                      "sha256":  "da6fb79c9c2ce5e6d5f6a2c12a5ac9e86b31e1566f116836187c1219d024979c"
+                  },
+                  {
+                      "path":  "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/scripts/platform_paths.lua",
+                      "bytes":  641,
+                      "sha256":  "0024d2975e7acac73aa47f9dcd4d0465de210d56b8cbd78c34734b81c01a049d"
+                  },
+                  {
+                      "path":  "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/scripts/player.lua",
+                      "bytes":  955,
+                      "sha256":  "9d76dd83324e8058925ef3d87aa56e545191d1d5ae13e2795c69efcf99f4e1be"
+                  },
+                  {
+                      "path":  "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/scripts/player_character.lua",
+                      "bytes":  19053,
+                      "sha256":  "95bf1eb93ad05d06a6e6ce1c2049ed1d03ecc8628fe454458a3aef441b119af2"
+                  },
+                  {
+                      "path":  "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/scripts/player_inventory.lua",
+                      "bytes":  32359,
+                      "sha256":  "131e99d9eb7937a6ceab4bb2b45d5294db5addc3e62132f9fb0bd6b397712309"
+                  },
+                  {
+                      "path":  "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/scripts/scheduler.lua",
+                      "bytes":  3160,
+                      "sha256":  "f68edfde02643e564daa9e8b08eaf8a9462667219f4ae17f8324045b4841f71f"
+                  },
+                  {
+                      "path":  "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/scripts/skill_slots.lua",
+                      "bytes":  11965,
+                      "sha256":  "6e3f040d42e088a9bba392459bd996973667df6b25b3f9c60977e4ced864fa66"
+                  },
+                  {
+                      "path":  "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/scripts/world.lua",
+                      "bytes":  23078,
+                      "sha256":  "d69ace783ab93f78c33535a9750e69179c6a50c9ba8698e26e142e7a2aecffbb"
+                  },
+                  {
+                      "path":  "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/UE4SS.dll",
+                      "bytes":  20640768,
+                      "sha256":  "ce5e3c46a920cc00b2817ac61e438c9162830290379d0b5b9c4dfc2b29459290"
+                  },
+                  {
+                      "path":  "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/UE4SS_Signatures/StaticConstructObject.lua",
+                      "bytes":  174,
+                      "sha256":  "a295dce50e9351da18da1c07b3a222a5e703066e9ba21581b00cb565a6ec83bd"
+                  },
+                  {
+                      "path":  "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/UE4SS-settings.ini",
+                      "bytes":  9557,
+                      "sha256":  "39293613ec689f068e34e9dcc276bed4769f773871fcbeed7ccb635efe7944af"
+                  },
+                  {
+                      "path":  "game/Dark and Darker-NoAC/steam_appid.txt",
+                      "bytes":  7,
+                      "sha256":  "495d368d1d98a08bf663599063075cfc6fc803f7861089c176db3b93e359de2b"
+                  },
+                  {
+                      "path":  "src/app/server/game_paths.js",
+                      "bytes":  709,
+                      "sha256":  "53ba62a7ff8d0fe1084654de430b56fa03b6ce1b83c8bf2baa4affaa807fe4d6"
+                  },
+                  {
+                      "path":  "src/app/server/generated/proto_generated.js",
+                      "bytes":  277528,
+                      "sha256":  "87e1dc055db8c066b12ad5c171c0afb59e6b7e8a12181b30b8c4b5c0c9a4aa68"
+                  },
+                  {
+                      "path":  "src/app/server/http_lobby.js",
+                      "bytes":  10144,
+                      "sha256":  "abcb1935c3ad23a56ab4b8c8cf011c5ca203b45dfed38a453702e67cb23a3e34"
+                  },
+                  {
+                      "path":  "src/app/server/lobby_class_profiles.js",
+                      "bytes":  25454,
+                      "sha256":  "9a8916e6b43d57ba9d6a46268c890a69f9948e54d7b5eba5951f3597943baac8"
+                  },
+                  {
+                      "path":  "src/app/server/lobby_offline.js",
+                      "bytes":  35904,
+                      "sha256":  "36f8c50761fb50fa9fdee26a444add7d8523c2aec00bc60a3ed43ce67e128141"
+                  },
+                  {
+                      "path":  "src/app/server/node.exe",
+                      "bytes":  93381448,
+                      "sha256":  "5c976096e04e5c2c1f091938926234cc9fbebfe9787ddd149351b3b0ecc707b5"
+                  },
+                  {
+                      "path":  "src/app/server/profile_db.js",
+                      "bytes":  10669,
+                      "sha256":  "6ac1e4160217765969dc02cfd9178f3056ea350e959ba473ffa3bc7c47dc8454"
+                  },
+                  {
+                      "path":  "src/app/server/proto_runtime.js",
+                      "bytes":  372,
+                      "sha256":  "e4bf95799ca40dac198b0bbc82f49661791a06464738185b818f1a6df39618e5"
+                  },
+                  {
+                      "path":  "src/app/server/protocol.js",
+                      "bytes":  1814,
+                      "sha256":  "06146a5fc41b93f672bf3e3cf7ace8f643251883eaef41185bca597b99f46281"
+                  },
+                  {
+                      "path":  "src/build/cache/catalog/profiles/0.18.160.10688/catalog.json",
+                      "bytes":  7152240,
+                      "sha256":  "c182a78bb8d5b2831d04cdc5da8ab7b18174191e019e7725528035f07746b29f"
+                  },
+                  {
+                      "path":  "src/build/cache/catalog/profiles/0.18.160.10688/catalog.lua",
+                      "bytes":  4819312,
+                      "sha256":  "31ab0ca52a6f7808d319b70e8d5e60c5a43efdc25b4bf8af9d70c2a08f84ab57"
+                  },
+                  {
+                      "path":  "src/build/cache/catalog/profiles/0.18.160.10688/catalog-meta.json",
+                      "bytes":  163,
+                      "sha256":  "81c18aaaef411b75256770df86bc8bae011b92187767d7d6f440c765b4588924"
+                  },
+                  {
+                      "path":  "src/build/cache/catalog/profiles/0.18.160.10688/pak-source-manifest.json",
+                      "bytes":  24223,
+                      "sha256":  "053047b43063d355a0385a791b3d7654b2919ef88b6b91a95926271bca763203"
+                  },
+                  {
+                      "path":  "src/build/cache/catalog/profiles/0.18.160.10688/ui-data.json",
+                      "bytes":  16394193,
+                      "sha256":  "d37e26c8679a5c6fbf52e3ce5bed04ab88c7faabc4e6ed89eb87b9f16bfe1ebd"
+                  },
+                  {
+                      "path":  "src/build/cache/catalog/profiles/0.18.160.10688/ui-data.lua",
+                      "bytes":  12958319,
+                      "sha256":  "dc76dd3bb15ec752e39f9e9582c53406179e71d864469bc523b6b6f286407507"
+                  },
+                  {
+                      "path":  "src/build/config/game-build-profiles.json",
+                      "bytes":  7110,
+                      "sha256":  "da448445c2c1cb2963d4ca4681779a5cce8ceedd99d13e002fd9a6502ecbe584"
+                  },
+                  {
+                      "path":  "src/build/config/release-manifest.json",
+                      "bytes":  5929,
+                      "sha256":  "1165945edeed5829c77e51abe98ce248496c07cbe76f8e3e6a77b65aa4de5ad6"
+                  },
+                  {
+                      "path":  "src/build/output/native/control_client.dll",
+                      "bytes":  618496,
+                      "sha256":  "e7bc20fe2f60396c74d18361f6355d2ea20d37725f1cb4da03a4ac7c01a62e7a"
+                  },
+                  {
+                      "path":  "src/build/output/native/gui.dll",
+                      "bytes":  910336,
+                      "sha256":  "13eeeb0349c55e94db8643cd482cb94e4ecfb9f4d9ae1788371e853e88e53d01"
+                  },
+                  {
+                      "path":  "src/build/output/native/training_core.dll",
+                      "bytes":  625152,
+                      "sha256":  "59fd4da57728d46b41de26490364a81f355e29aeafbfe1c6c3f9699dcb1909f7"
+                  },
+                  {
+                      "path":  "src/build/output/network-policy/network_policy.exe",
+                      "bytes":  382464,
+                      "sha256":  "5826aba4990644c06d90696941bf61d493b9e8ae82ede006b374b5b9f631ec49"
+                  }
+              ],
+    "deleted":  [
+
+                ]
+}

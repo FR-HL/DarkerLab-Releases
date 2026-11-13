@@ -1,0 +1,964 @@
+-- Domain module. Generated from the old single-purpose Lua modules.
+local ROOT=assert(os.getenv('DARKERLAB_ROOT'),'DARKERLAB_ROOT is not set')
+local MOD=_G.__DARKERLAB_MOD_DIR or (ROOT..'/game/'..(os.getenv('DARKERLAB_GAME_COPY') or 'Dark and Darker-NoAC')..'/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/scripts/')
+local Paths=dofile(MOD..'platform_paths.lua')
+_G.__DARKERLAB_PATHS=Paths
+local function loadDomain(name)
+ local cache=_G.__DARKERLAB_DOMAIN_CACHE or {};_G.__DARKERLAB_DOMAIN_CACHE=cache
+ if not cache[name] then cache[name]=dofile(MOD..name..'.lua') end
+ return cache[name]
+end
+local Core=loadDomain('core')
+local Player=loadDomain('player')
+local Mailbox=loadDomain('panel_runtime')
+local function publishModel(name,text) if text and text~='' then Mailbox.publishModel(name,text) end end
+local Commands=loadDomain('panel_commands')
+
+local Monster=loadDomain('monster')
+local World=loadDomain('world')
+_G.__DARKERLAB_TRAINING_PANEL = _G.__DARKERLAB_TRAINING_PANEL or {visible=false,guard=true,guardOriginal={}}
+local Encounter=loadDomain('encounter')
+local UIModel=loadDomain('panel_view')
+local function make_Panel()
+  local ROOT=assert(os.getenv('DARKERLAB_ROOT'),'DARKERLAB_ROOT is not set')
+-- In-process training UI; only the game thread accesses Unreal objects.
+local GAME_ROOT=Paths.game
+_G.__DARKERLAB_GAME_ROOT=GAME_ROOT
+local MOD=Paths.mod
+local OUT=Paths.output
+local BuildProfile=dofile(MOD..'scripts/build_profile.lua')
+local Scheduler=dofile(MOD..'scripts/scheduler.lua')
+local Guard=Player.guard
+local Runtime=Encounter.runtime
+local AbilityRecovery=Player.ability_recovery
+local CharacterReset=Player.character_reset
+local Classes=Player.classes
+local Inventory=Player.inventory
+local Catalog=Core.catalog
+local UI=UIModel
+local Abilities=loadDomain('abilities')
+local NativeLoadout=loadDomain('native_loadout')
+local NativeShapeMemory=loadDomain('native_shape_memory')
+local NativeDruidLifecycle=loadDomain('native_druid_lifecycle')
+local Mailbox=loadDomain('panel_runtime')
+local RUNTIME=Paths.runtime
+local startGui
+
+local PanelHotkeys=loadDomain('panel_hotkeys')
+local Positions=Core.positions
+local Attributes=Player.attributes
+local S=_G.__DARKERLAB_TRAINING_PANEL or {visible=true,guard=true,guardOriginal={}}
+_G.__DARKERLAB_TRAINING_PANEL=S
+S.inventory=Inventory
+S.generation=(S.generation or 0)+1
+S.lastCommandId=Mailbox.readAck()
+local generation=S.generation
+local loadoutSmoke=os.getenv('DARKERLAB_LOADOUT_SMOKE')=='1' and not S.loadoutSmokeDone
+S.action=S.action or 'Ready; original combat remains experimental'
+S.deathFailure=S.deathFailure or false
+S.monsters=S.monsters or {}
+S.selectedMonster=S.selectedMonster or 'lich'
+S.loadoutCount=S.loadoutCount or 0
+if S.repeatTraining==nil then S.repeatTraining=true end
+if S.autoHeal==nil then S.autoHeal=true end
+if S.autoRecover==nil then S.autoRecover=false end
+if S.infiniteStackables==nil or not S.infiniteDefaultApplied then
+  S.infiniteStackables=false
+  S.infiniteDefaultApplied=true
+end
+S.sceneMode=S.sceneMode or'current'
+if S.roomReady==nil then S.roomReady=false end
+-- The panel starts expanded; the first Tab/Esc press must hide it instead of
+-- requiring the user to close it once manually.
+if S.panelVisible==nil then S.panelVisible=true end
+if S.panelOnMenuKeys==nil then S.panelOnMenuKeys=true end
+S.attributeDefaultsByClass=S.attributeDefaultsByClass or{}
+-- Refresh the visible catalog after loading a new inventory module.
+S.inventoryCaptured=nil
+local function log(s) print('[TRAINING-PANEL] '..tostring(s)) end
+local function valid(o)
+  if o==nil then return false end
+  local ok,v=pcall(function()return o:IsValid()end)
+  if ok then return v==true end
+  local ok2,addr=pcall(function()return o:GetAddress()end)
+  return ok2 and addr~=nil and addr~=0
+end
+local function ensureGameInfoFallback(world)
+  if not valid(world)or not world:GetFullName():find('/Arena/',1,true)then return false end
+  local ok,result=pcall(function()
+    local gs=world.GameState;assert(valid(gs),'Current arena GameState missing')
+    local address=gs:GetAddress()
+    if S.gameInfoFallbackInstalled and S.gameInfoFallbackState==address then return true end
+    if S.gameInfoFallbackRetryAt and os.time()<S.gameInfoFallbackRetryAt then return false end
+    S.gameInfoFallbackRetryAt=os.time()+3
+    local dll=OUT..'training_core.dll'
+    local install,loadError=package.loadlib(dll,'native_training_gameinfo_fallback_install_direct');assert(install,loadError)
+    assert(install(address)==1,'GameInfo fallback rejected this GameState')
+    S.gameInfoFallbackInstalled=true;S.gameInfoFallbackState=address;S.gameInfoFallbackRetryAt=nil
+    log('null-only GameInfo fallback installed state='..string.format('%x',address))
+    return true
+  end)
+  if not ok then S.gameInfoFallbackInstalled=false;S.gameInfoFallbackState=nil;log('GameInfo fallback pending: '..tostring(result))end
+  return ok and result==true
+end
+local function player()
+  local pc=require('UEHelpers').GetPlayerController()
+  if not valid(pc) then return nil,nil end
+  local p=pc.Pawn
+  if not valid(p) then return pc,nil end
+  local full=p:GetFullName()
+  if not full:find('BP_PlayerCharacter',1,true) then return pc,nil end
+  return pc,p
+end
+-- Reference completion bridge: ends the original stuck shape cast and applies
+-- the selected native form asset through the original abilities/events.
+if not S.druidLifecycle then
+  local okLifecycle,lifecycle=pcall(NativeDruidLifecycle.install,{enabled=true,getContext=function()
+    local _,p=player()
+    if not valid(p) then return nil end
+    local world=p:GetWorld()
+    if not valid(world) then return nil end
+    return {pawn=p,world=world,world_id=world:GetAddress()}
+  end})
+  if okLifecycle then S.druidLifecycle=lifecycle;log('native druid lifecycle installed')
+  else log('native druid lifecycle install failed: '..tostring(lifecycle)) end
+end
+-- Republish the host memory as soon as the shape wheel becomes visible instead
+-- of waiting for the 250 ms panel tick.
+if not S.shapeVisibilityHook then
+  local okHook,pre,post=pcall(RegisterHook,'/Script/DungeonCrawler.GameGroupWidgetBase:OnGroupWidgetVisibilityChanged',function()end,function()
+    local _,p=player()
+    if not valid(p)then return end
+    Scheduler.dispatch(function()pcall(NativeShapeMemory.tick,p)end)
+  end)
+  if okHook then S.shapeVisibilityHook={pre,post};log('shape visibility hook registered')
+  else log('shape visibility hook failed: '..tostring(pre)) end
+end
+local function health(p)
+  local asc=p.AbilitySystemComponent
+  if not valid(asc) then return end
+  local sets=asc.SpawnedAttributes
+  for i=1,#sets do local a=sets[i]
+    if valid(a) and a:GetClass():GetFName():ToString()=='DCAttributeSet' then return a.Health.CurrentValue,a.MaxHealth.CurrentValue,a end
+  end
+end
+local function attributeEffectName(p)
+  local class=tonumber(p and p.CharacterKey and p.CharacterKey.CharacterClass)
+  local name=class and Classes.names[class]
+  assert(name,'Attribute: 当前职业无法识别')
+  return class,'Id_PlayerCharacterEffect_'..name
+end
+local function publish()
+  S.visible=S.panelVisible and true or false
+  local choice,class=Classes.selected()
+  local shownChoice=S.attributePreviewClass or choice
+  local shownClass=Classes.names[shownChoice] or class
+  S.uiPresets=table.concat(Inventory.presetNames(tonumber(S.uiActualClass) or choice),'|')
+  local values=UI.stateTable(S,_G.__DARKERLAB_SWITCHBOARD,nil,shownChoice,shownClass)
+  Mailbox.publishState(values)
+end
+local Recovery=loadDomain('panel_recovery')({S=S,player=player,valid=valid,health=health,log=log,Scheduler=Scheduler,AbilityRecovery=AbilityRecovery})
+local autoHeal=Recovery.autoHeal
+local recoverAttack=Recovery.recoverAttack
+local attackBlocked=Recovery.attackBlocked
+local function snapshot()
+  local pc,p=player();assert(pc,'No local controller')
+  local f=assert(io.open(RUNTIME..'panel-snapshot-'..os.date('%H%M%S')..'.log','w'))
+  f:write('time='..os.date('%Y-%m-%d %H:%M:%S')..'\nworld='..pc:GetWorld():GetFullName()..'\n')
+  f:write('pawn='..(p and p:GetFullName() or 'NONE')..'\n'..(S.sample or '')..'\n')
+  for _,m in ipairs(S.monsters) do
+    if valid(m) then local q=m:K2_GetActorLocation()
+      f:write(m:GetFullName()..string.format(' pos=%.1f %.1f %.1f',q.X,q.Y,q.Z)..' GAS='..tostring(m.AbilitySystemComponent.bGASInitilized)..' handles='..#m.AbilitySystemComponent.AbilityHandleDataArray.Items..'\n')
+    end
+  end
+  f:close();S.action='Debug snapshot saved';log(S.action)
+end
+local Switch=Encounter.switchboard
+S.onTrainingPhase=function(phase,raw,generation)UI.trainingPhase(S,phase,raw,generation)end
+publishModel('panel-monsters.tsv',(UI.writeMonsters(Catalog)))
+publishModel('panel-classes.tsv',(UI.writeClasses(Classes.names)))
+publishModel('panel-boss-rooms.tsv',(Catalog.writeBossRooms()))
+publishModel('panel-items.tsv',(UI.writeItems(Inventory.names())))
+publishModel('panel-property-pools.tsv',(UI.writePropertyPools()))
+local function applySpeed(force)
+  local _,p=player()
+  if p and S.playerSpeed and (force or p.CustomTimeDilation~=S.playerSpeed) then
+    pcall(function() p.CustomTimeDilation=S.playerSpeed end)
+  end
+  if S.monsterSpeed then
+    pcall(function()
+      local list=FindAllOf('BP_DCMonsterBaseWithOptions_C')
+      if list then for _,m in ipairs(list) do pcall(function() m.CustomTimeDilation=S.monsterSpeed end) end end
+    end)
+  end
+end
+local ABILITY_LIMITS={skill=2,perk=4,spell=5,shift=5,music=5}
+local ABILITY_NAMES={skill='技能',perk='天赋',spell='法术',shift='变形',music='音乐'}
+local function classIdOf(p)
+  local class=tonumber(p and p.CharacterKey and p.CharacterKey.CharacterClass)
+  local name=class and Classes.names[class]
+  return name and ('Id_PlayerCharacter_'..name) or nil
+end
+local function writeAbilitySlots(classId,useDefaults)
+  local defaults=Abilities.defaults(classId)
+  local equipped=useDefaults and defaults or S.abilityEquipped
+  if equipped==nil then equipped=defaults end
+  local out={}
+  for _,cat in ipairs({'skill','spell','perk','shift','music'})do
+    local values=equipped[cat]or defaults[cat]or{}
+    for slot=1,5 do
+      if values[slot]and values[slot]~=''then
+        out[#out+1]=cat..'\t'..slot..'\t'..values[slot]
+      end
+    end
+  end
+  return table.concat(out,'\n')..'\n'
+end
+local function abilityCatalog()
+  local _,p=player()
+  local classId=classIdOf(p)
+  local text,catalogue=Abilities.write(classId)
+  publishModel('panel-abilities.tsv',text)
+  publishModel('panel-ability-slots.tsv',writeAbilitySlots(classId))
+  local counts={}
+  for _,k in ipairs({'skill','spell','perk','shift','music'})do counts[#counts+1]=k..'='..#catalogue[k] end
+  S.action='Ability catalogue: '..table.concat(counts,', ')..' class='..tostring(classId)
+  log(S.action)
+end
+local function reloadRoom(room)
+  room=room or S.room or 1
+  assert(type(_G.loadRoom)=='function','loadRoom is unavailable')
+  local ok,e=pcall(_G.loadRoom,room)
+  if not ok then log('room reload failed: '..tostring(e)) end
+end
+local function shiftAudit(p)
+  local seen=S.shiftAuditSeen or{};S.shiftAuditSeen=seen
+  local asc=p and p.AbilitySystemComponent
+  if valid(asc)then
+    local items=asc.ActivatableAbilities and asc.ActivatableAbilities.Items
+    local n=0;pcall(function()n=#items end)
+    for i=1,math.min(n,128)do
+      local raw=items[i];local spec=raw
+      pcall(function()if raw.get then spec=raw:get()end end)
+      local ability=spec and spec.Ability;local aname=valid(ability)and ability:GetFullName()or''
+      if aname:find('ShapeShift',1,true)then
+        local active=tonumber(spec.ActiveCount)or 0
+        local k='s|'..aname..'|'..active..'|'..tostring(spec.InputPressed)
+        if not seen[k]then seen[k]=true;log('AUDIT spec '..aname..' active='..active..' input='..tostring(spec.InputPressed))end
+        for _,arrName in ipairs({'NonReplicatedInstances','ReplicatedInstances'})do
+          local arr=spec[arrName];local m=0;pcall(function()m=#arr end)
+          for j=1,math.min(m,4)do
+            local inst=arr[j];pcall(function()if inst.get then inst=inst:get()end end)
+            local dat=inst.CurrentShapeShiftDataAsset;local mont=inst.CurrentMontage
+            local st=(valid(dat)and dat:GetFullName()or'nil')..'|'..(valid(mont)and mont:GetFullName()or'nil')..'|'..tostring(inst.bIsAbilityEnding)
+            local ik='i|'..aname..'|'..j..'|'..st
+            if not seen[ik]then seen[ik]=true;log('AUDIT inst '..aname..' data='..st)end
+          end
+        end
+      end
+    end
+  end
+  local c=p and p.ShapeShiftComponent
+  if valid(c)then
+    local cur=valid(c.Data)and c.Data:GetFullName()or'nil'
+    local ah=c.AbilitySpecHandles;local an=0;pcall(function()an=#ah end)
+    local eh=c.GameplayEffectHandles;local en=0;pcall(function()en=#eh end)
+    local k='c|'..cur..'|'..an..'|'..en
+    if not seen[k]then seen[k]=true;log('AUDIT comp data='..cur..' handles='..an..' effects='..en)end
+  end
+  local sc=p and p.SkillComponent
+  if valid(sc)then
+    local sd=sc.ShapeShiftSkillDatas;local dn=0;pcall(function()dn=#sd end)
+    local k='d|'..dn
+    if not seen[k]then seen[k]=true;log('AUDIT skill.datas='..dn)end
+  end
+  local cc=p and p.ClassShapeShiftComponent
+  if valid(cc)then
+    local sd=cc.ShapeShiftDatas;local dn=0;pcall(function()dn=#sd end)
+    local k='k|'..dn
+    if not seen[k]then seen[k]=true;log('AUDIT class.datas='..dn)end
+  end
+end
+
+-- Native loadout apply. The class row is the only writable source: the
+-- original initializer builds perks/skills/spells/musics from it. No ability
+-- is granted here and no runtime component is written.
+local function mergedMemory(cat,group,slots)
+  local out={}
+  for i=1,10 do out[i]='' end
+  local first=S.abilityEquipped and S.abilityEquipped[cat..'#1']or{}
+  local second=S.abilityEquipped and S.abilityEquipped[cat..'#2']or{}
+  if group==1 then first=slots elseif group==2 then second=slots end
+  for i=1,5 do out[i]=first[i]or'';out[i+5]=second[i]or'' end
+  return out
+end
+local function abilityApply(acat,payload,group)
+  local _,p=player();assert(p,'No dungeon player')
+  local limit=ABILITY_LIMITS[acat];assert(limit,'ability apply: unknown category')
+  local text=tostring(payload or'');local slots={};local seen={};local count=0;local start=1
+  while true do
+    local stop=text:find('|',start,true)
+    local id=text:sub(start,stop and stop-1 or #text)
+    slots[#slots+1]=id
+    if id~=''then
+      assert(not seen[id],'同一能力不能放在两个槽位：'..id)
+      seen[id]=true;count=count+1
+    end
+    if not stop then break end
+    start=stop+1
+  end
+  assert(count<=limit,ABILITY_NAMES[acat]..'最多 '..limit..' 个（当前 '..count..'）')
+  local choice=Classes.selected()
+  if acat=='shift'then
+    S.action='变形形态由原版职业行生成：本页不再写入轮盘、技能或形态数据'
+    log(S.action)
+    return
+  end
+  if (acat=='spell'or acat=='music')and group==nil then group=1 end
+  if acat=='spell'then
+    assert(NativeLoadout.spellBankEnabled(choice),'先应用技能页的法术记忆（SpellMemory/Sorcery），原版才会生成法术槽')
+  elseif acat=='music'then
+    assert(NativeLoadout.musicBankEnabled(choice),'先应用技能页的音乐记忆（MusicMemory），原版才会生成音乐槽')
+  end
+  S.abilityEquipped=S.abilityEquipped or{}
+  S.abilityEquipped[acat..(group and('#'..tostring(group))or'')]=slots
+  local nativeSlots
+  if acat=='spell'or acat=='music'then nativeSlots=mergedMemory(acat,group,slots)
+  else nativeSlots={};for _,id in ipairs(slots)do if id~=''then nativeSlots[#nativeSlots+1]=id end end end
+  NativeLoadout.setCategory(choice,acat,nativeSlots)
+  local report=NativeLoadout.apply(choice)
+  assert(report and report.applied,'本 build 无法写入原版职业行；不会回退手动授予（UE4SS 数组赋值实测会崩溃）')
+  S.abilityPending={class=choice,category=acat,group=group,expected=nativeSlots,started=os.time()}
+  S.abilityPreviewClass=nil
+  publishModel('panel-ability-slots.tsv',writeAbilitySlots(classIdOf(p)))
+  S.action='已写入原版职业行：'..ABILITY_NAMES[acat]..' '..count..' 项；正在重载本轮以让原版初始化生效'
+  log(S.action)
+  reloadRoom(S.room or 1)
+end
+
+local function shiftState()
+  local _,p=player()
+  if not valid(p)then log('SHIFT-STATE no player');return end
+  log('ABILITY-STATE class='..tostring(p.CharacterKey.CharacterClass)..' perks='..#p.PerkDataComponent.PerkDataIds..' skills='..#p.SkillComponent.SkillActors..' spells='..#p.SpellComponent.SpellActors)
+  local cap=NativeLoadout.capture(tonumber(p.CharacterKey.CharacterClass))
+  if cap and cap.row then log('ABILITY-STATE row perk='..#cap.row.perk..' skill='..#cap.row.skill..' spell='..#cap.row.spell..' music='..#cap.row.music) end
+  local asc=p.AbilitySystemComponent
+  local items=asc.ActivatableAbilities.Items
+  for i=1,#items do
+    local spec=items[i];local ability=spec.Ability;local name=valid(ability)and ability:GetFullName()or''
+    if name:find('ShapeShift',1,true)then
+      log('SHIFT-STATE spec '..name..' activeCount='..tostring(spec.ActiveCount))
+      for _,field in ipairs({'NonReplicatedInstances','ReplicatedInstances'})do
+        local arr=spec[field]
+        for j=1,#arr do
+          local inst=arr[j];pcall(function()if inst.get then inst=inst:get()end end)
+          if valid(inst)then
+            local data=inst.CurrentShapeShiftDataAsset
+            log('SHIFT-STATE inst '..name..' active='..tostring(inst.bIsActive)..' ending='..tostring(inst.bIsAbilityEnding)..' asset='..(valid(data)and data:GetFullName()or'nil'))
+          end
+        end
+      end
+    end
+  end
+  local c=p.ShapeShiftComponent
+  log('SHIFT-STATE data='..(valid(c.Data)and c.Data:GetFullName()or'nil')..' applied='..(valid(c.AppliedData)and c.AppliedData:GetFullName()or'nil')..' specs='..#c.AbilitySpecHandles..' effects='..#c.GameplayEffectHandles)
+  local mem=p.ClassShapeShiftComponent
+  log('SHIFT-STATE memory='..#mem.ShapeShiftDatas)
+  local life=S.druidLifecycle
+  if life then log('SHIFT-STATE lifecycle started='..tostring(life.started)..' triggered='..tostring(life.triggered)..' applied='..tostring(life.applied)..' errors='..tostring(life.errors)..' stage='..tostring(life.lastStage)..' error='..tostring(life.lastError)..' context='..tostring(life.lastContextError)..' observe='..tostring(life.lastObservation))end
+  S.action='shift state written';log(S.action)
+end
+
+local function command(raw)
+  if Commands.simple(raw,S,startGui,Switch) then return end
+  if raw:find("\n",1,true)then
+    for line in raw:gmatch("[^\r\n]+")do
+      local ok,e=pcall(command,line)
+      if not ok then S.action=tostring(e);log(S.action)end
+    end
+    return
+  end
+  raw=raw:gsub('^%s+',''):gsub('%s+$','');log('command='..raw)
+  local sp,spv=raw:match('^speed%s+(%a+)%s+([%d%.]+)$')
+  if sp then
+    local v=tonumber(spv);assert(v and v>0,'Speed must be a positive number')
+    if sp=='player'then S.playerSpeed=v elseif sp=='monster'then S.monsterSpeed=v else error('speed player|monster <0.05-2>')end
+    applySpeed(true);S.action='速度已设置：'..sp..'='..v;return
+  end
+  -- 面板一次只能写一条命令（命令队列），所以玩家+怪物合成一条。
+  local pv,mv=raw:match('^speed%s+both%s+([%d%.]+)%s+([%d%.]+)$')
+  if pv then
+    local a,b=tonumber(pv),tonumber(mv);assert(a and b and a>0 and b>0,'Speed must be a positive number')
+    S.playerSpeed=a;S.monsterSpeed=b;applySpeed(true);S.action='速度已设置：player='..a..' monster='..b;return
+  end
+  if raw=='speed' then S.action='当前速度：player='..tostring(S.playerSpeed or 1)..' monster='..tostring(S.monsterSpeed or 1);return end
+  if raw=='guard'or raw=='guard on'or raw=='guard off'then
+    local _,p=player();assert(p,'No dungeon player')
+    local desired=raw=='guard on'or(raw=='guard'and not S.guard)
+    if desired then S.guardState=Guard.enable(p,S.guardState)else S.guardState=Guard.disable(p,S.guardState)end
+    S.guard=Guard.has(p);S.uiGuardActual=S.guard;assert(S.guard==desired,'Original immunity state did not match request')
+    S.action='Original player immunity '..(S.guard and 'enabled' or 'disabled');return
+  end
+  if raw=='autoheal'or raw=='autoheal on'or raw=='autoheal off'then S.autoHeal=raw=='autoheal on'or(raw=='autoheal'and not S.autoHeal);S.nextAutoHeal=nil;S.action='Auto heal: '..tostring(S.autoHeal);return end
+  if raw=='snapshot' then snapshot();return end
+  local applyCat,applyGroup,applyIds=raw:match("^ability apply (%a+)#?(%d*)%s*(.*)$")
+  if applyCat then abilityApply(applyCat,applyIds,tonumber(applyGroup));return end
+  if raw=='ability-catalog' then abilityCatalog();return end
+  if raw=='shift-state' then shiftState();return end
+  if raw=='native-capture' then
+    local choice=Classes.selected()
+    local report=NativeLoadout.capture(choice)
+    for _,key in ipairs({'perk','skill','spell','music'})do
+      log('NATIVE-ROW '..key..'='..table.concat((report.row and report.row[key])or{},','))
+      log('NATIVE-ACCOUNT '..key..'='..table.concat((report.account and report.account[key])or{},','))
+    end
+    S.action='Native class-row capture written to log';return
+  end
+  if raw=='recover-attack'then recoverAttack();return end
+  if raw=='autorecover on'or raw=='autorecover off'then S.autoRecover=raw=='autorecover on';S.abilityRecoveryAutoTick=0;S.action='Auto attack recovery: '..tostring(S.autoRecover);return end
+  if raw=='reset-character'then
+    local _,p=player();assert(p,'No dungeon player')
+    assert(S.characterResetBaseline and S.characterResetBaseline.address==p:GetAddress(),'Character reset baseline unavailable')
+    local lib=StaticFindObject('/Script/GameplayAbilities.Default__AbilitySystemBlueprintLibrary')
+    local getEffect=StaticFindObject('/Script/GameplayAbilities.AbilitySystemBlueprintLibrary:GetGameplayEffectFromActiveEffectHandle')
+    local cancel=StaticFindObject('/Script/GameplayAbilities.GameplayAbility:K2_CancelAbility')
+    local clear=StaticFindObject('/Script/DungeonCrawler.DCCharacterBase:RemoveAllLocalStateTags')
+    local preserve={}
+    if S.guardState then for _,h in ipairs(S.guardState.handles or{})do preserve[h.Handle]=true end end
+    local result=CharacterReset.reset(p,S.characterResetBaseline,{
+      valid=valid,name=function(o)return o and o:GetFullName()or''end,effect=function(h)return getEffect(lib,h)end,
+      cancel=function(instance)return cancel(instance)end,preserveHandles=function()return preserve end,removeLocalState=function(target)return clear(target)end,
+    })
+    S.action=string.format('Character state reset: abilities=%d owned_effects=%d transient_effects=%d',result.abilities,result.ownedEffects,result.transientEffects)
+    log(S.action)
+    return
+  end
+  if raw:match('^ui%-reload%s+%d+$')then
+    local v=raw:match('^ui%-reload%s+(%d+)$')
+    local ok,stop=pcall(package.loadlib,OUT..BuildProfile.gui,'darkerlab_training_gui_stop')
+    if ok and stop then stop()end
+    Scheduler.loop(400,function()
+      if startGui then pcall(startGui);log('ui reload v'..v)else log('ui reload failed v'..v..' no start entry')end
+      return true
+    end)
+    return
+  end
+  if raw=='infinite'or raw=='infinite on'or raw=='infinite off'then S.infiniteStackables=raw=='infinite on'or(raw=='infinite'and not S.infiniteStackables);S.action='Infinite consumables: '..tostring(S.infiniteStackables);return end
+  if raw=='repeat'or raw=='repeat on'or raw=='repeat off'then S.repeatTraining=raw=='repeat on'or(raw=='repeat'and not S.repeatTraining);S.action='Restore training after native respawn: '..tostring(S.repeatTraining);return end
+  if raw=='reset' then Switch.refresh();return end
+  if raw=='reset-position'then Switch.resetPositions();return end
+  local bossRoom=raw:match('^boss%-room%s+(.+)$')
+  if bossRoom then S.sceneMode='room';Switch.enterRoom(bossRoom);return end
+  local saveName=raw:match('^save%-loadout%s+(.+)$')
+  if raw=='save-loadout'or saveName then
+    local _,p=player();assert(p,'No dungeon player')
+    local name=saveName or '默认配装'
+    local count,class=Inventory.savePreset(p,name);S.loadoutCount=count;S.presetPawn=p:GetAddress()
+    S.action='Saved '..Classes.names[class]..' preset "'..name..'": '..count..' equipped items';log(S.action);return
+  end
+  local applyName=raw:match('^apply%-loadout%s+(.+)$')
+  if applyName then
+    local _,p=player();assert(p,'No dungeon player')
+    local applied,class=Inventory.applyPreset(p,applyName)
+    S.presetPawn=p:GetAddress();S.loadoutCount=applied
+    S.action='Preset "'..applyName..'" equipped to slots: '..applied..' parts';log(S.action);return
+  end
+  local loadName=raw:match('^load%-loadout%s+(.+)$')
+  if raw=='restore-loadout'or raw=='load-loadout'or loadName then
+    local _,p=player();assert(p,'No dungeon player')
+    local name=loadName or '默认配装'
+    local records,class=Inventory.loadPreset(p,name);assert(records,'Preset not found: '..name)
+    Inventory.restore(p,records);S.presetPawn=p:GetAddress();S.loadoutCount=#records
+    S.action='Preset "'..name..'" restored to bag: '..#records..' records';log(S.action);return
+  end
+  local equipSlot,equipItem=raw:match('^equip%-slot (%d+) (Id_Item_[%w_]+)$')
+  if equipSlot then
+    local _,p=player();assert(p,'No dungeon player')
+    local id,slot=Inventory.equipSlot(p,equipItem,tonumber(equipSlot))
+    S.presetPawn=p:GetAddress();S.action='Equipped original item: '..equipItem..' ('..id..') slot='..tostring(slot);log(S.action);return
+  end
+  local equip=raw:match('^equip (Id_Item_[%w_]+)$')
+  if equip then
+    local _,p=player();assert(p,'No dungeon player');local id=Inventory.equip(p,equip)
+    S.loadoutCount=Inventory.saveLoadout(p);S.presetPawn=p:GetAddress()
+    S.action='Added to bag; equip manually: '..equip..' ('..id..')';log(S.action);return
+  end
+  local attributeRaw=raw:match('^attributes%s+(.+)$')
+  if attributeRaw then
+    local _,p=player();assert(p,'No dungeon player')
+    local class,name=attributeEffectName(p)
+    if not S.attributeDefaultsByClass[class]then S.attributeDefaultsByClass[class]=Attributes.readEffect(name,Attributes.read(p))end
+    local target
+    local reset=attributeRaw=='reset'
+    if reset then
+      target=S.attributeDefaultsByClass[class]
+    else
+      local valuesText=attributeRaw:match('^set%s+(.+)$')or attributeRaw
+      assert(not valuesText:find('[^%d%s]'),'Attribute value: 只接受整数')
+      local values={}
+      for value in valuesText:gmatch('%d+')do values[#values+1]=tonumber(value)end
+      Attributes.validate(values);target=values
+    end
+    local applied=Attributes.writePlayer(p,target)
+    S.attributeTarget={class=class,name=name,values=target,applied=true}
+    S.attributePending={class=class,target=target,started=os.time(),reset=reset}
+    S.attributeValues=applied
+    S.uiSequence=(S.uiSequence or 0)+1
+    S.uiResult={id=S.uiSequence,kind='attributes',status='ok',title=reset and'基础属性已恢复默认'or'基础属性已应用',detail=reset and'角色当前七项基础值已恢复默认。'or'角色当前七项基础值已直接写入。'}
+    S.action=reset and'基础属性已恢复默认' or'基础属性已应用';log(S.action);return
+  end
+  local preview=tonumber(raw:match('^class%-preview (%d+)$'))
+  if preview then
+    local className=Classes.names[preview];assert(className,'Unknown original class')
+    local effectName='Id_PlayerCharacterEffect_'..className
+    local ok,values=pcall(Attributes.readEffect,effectName)
+    if not ok or type(values)~='table'then values=S.attributeValues end
+    S.attributePreviewClass=preview
+    S.attributePreviewValues=values
+    S.attributeValues=values
+    S.abilityPreviewClass=preview
+    local previewClassId='Id_PlayerCharacter_'..className
+    local actualClass
+    local _,p=player()
+    if p then actualClass=tonumber(p.CharacterKey and p.CharacterKey.CharacterClass) end
+    pcall(function()
+      local text=Abilities.write(previewClassId)
+      publishModel('panel-abilities.tsv',text)
+      publishModel('panel-ability-slots.tsv',writeAbilitySlots(previewClassId,preview~=actualClass))
+    end)
+    S.action='预览职业：'..className
+    log(S.action)
+    return
+  end
+  local career,careerValues=raw:match('^career apply (%d+)%s+(.+)$')
+  if career then
+    local choice=tonumber(career)
+    local className=Classes.names[choice];assert(className,'Unknown original class')
+    local values={}
+    for value in careerValues:gmatch('%d+')do values[#values+1]=tonumber(value)end
+    Attributes.validate(values)
+    Classes.select(choice)
+    Attributes.writeEffect('Id_PlayerCharacterEffect_'..className,values)
+    S.attributeDefaultsByClass[choice]=values
+    S.attributeTarget={class=choice,name='Id_PlayerCharacterEffect_'..className,values=values,applied=nil}
+    S.attributePreviewClass=nil
+    S.attributePreviewValues=nil
+    S.abilityPreviewClass=nil
+    S.abilityEquipped=nil
+    S.attributeValues=values
+    S.attributePending={class=choice,target=values,started=os.time()}
+    S.classSwitchPending={choice=choice,started=os.time()}
+    S.uiActualClass=nil
+    S.uiError=nil
+    reloadRoom(S.room or 1)
+    S.action='训练职业与属性已应用，正在重载本轮'
+    log(S.action)
+    return
+  end
+  local choice=tonumber(raw:match('^class (%d+)$'))
+  if choice then
+    Classes.select(choice);S.loadoutCount=0;S.presetPawn=nil;S.uiActualClass=nil;S.uiError=nil
+    S.attributeTarget=nil;S.attributePending=nil;S.attributeValues=nil
+    S.attributePreviewClass=nil;S.attributePreviewValues=nil;S.abilityPreviewClass=nil
+    S.classSwitchPending={choice=choice,started=os.time()}
+    S.action='正在应用训练职业：'..(Classes.names[choice]or tostring(choice))
+    reloadRoom(S.room or 1);return
+  end
+  local item=raw:match('^item (Id_Item_[%w_]+)$')
+  if item then local _,p=player();assert(p,'No dungeon player');local id=Inventory.add(p,item);S.loadoutCount=Inventory.saveLoadout(p);S.presetPawn=p:GetAddress();S.action='Added to original bag: '..item..' ('..id..')';return end
+  if raw=='lobby' then
+    local pc=require('UEHelpers').GetPlayerController()
+    assert(valid(pc),'No PlayerController for lobby travel')
+    local ok,result=pcall(function()return pc:SwitchLevel('/Game/DungeonCrawler/Maps/Lobby_P?Name=Player?AccountId=1')end)
+    assert(ok,'Lobby SwitchLevel failed: '..tostring(result))
+    S.action='Returning to lobby';return
+  end
+  local room=tonumber(raw:match('^room (%d+)$'))
+  if room then
+    assert(room>=1 and room<=14,'Invalid room')
+    S.room=room
+    S.activeMonster=nil;S.restartMonster=nil;S.replayPending=nil;S.victoryAt=nil;S.observedMonster=nil
+    Switch.clear();Runtime.clear(S.monsters)
+    S.spawnStage=nil;S.monsters={};S.travelUntil=os.time()+8
+    reloadRoom(room)
+    S.action='Loading original room '..room;return
+  end
+  if raw=='clear' then Switch.clear();return end
+  local mode,key=raw:match('^switch%-scene (current) (.+)$')
+  if not mode then mode,key=raw:match('^switch%-scene (original) (.+)$')end
+  if mode then S.roomReady=false;Switch.select(key,{mode=mode});S.sceneMode=mode;return end
+  key=raw:match('^spawn (.+)$')or raw:match('^switch (.+)$')
+  if key then Switch.select(key,{mode=S.sceneMode});return end
+  error('Unsupported panel command: '..raw)
+end
+local function execute(raw)
+  local receipt=UI.beginCommand(S,raw);local ok,e=pcall(command,raw)
+  if ok then S.actionUntil=os.time()+6 end
+  UI.finishCommand(S,Switch,receipt,ok,e)
+  if not ok then S.action=tostring(e);log(S.action)end
+  return ok,e
+end
+local function unwrap(value)
+  local ok,inner=pcall(function() return value:get() end)
+  if ok and inner~=nil then return inner end
+  return value
+end
+local function assetName(id)
+  if id==nil then return '' end
+  local ok,name=pcall(function() return id.PrimaryAssetName:ToString() end)
+  if ok and name and name~='None' then return name end
+  return ''
+end
+local function nativeAbilitySnapshot(p)
+  local out={}
+  pcall(function()
+    local values={};local arr=p.PerkDataComponent.PerkDataIds
+    for i=1,#arr do values[i]=assetName(arr[i]) end
+    out.perk=values
+  end)
+  pcall(function()
+    local values={};for i=1,2 do values[i]='' end
+    local arr=p.SkillComponent.SkillActors
+    for i=1,#arr do
+      local actor=unwrap(arr[i])
+      if valid(actor) then
+        local slot=tonumber(actor.SkillData.SlotIndex)
+        local id=assetName(actor.SkillData.SkillId)
+        if slot and id~='' then values[slot+1]=id end
+      end
+    end
+    out.skill=values
+  end)
+  pcall(function()
+    local values={};for i=1,10 do values[i]='' end
+    local arr=p.SpellComponent.SpellActors
+    for i=1,#arr do
+      local actor=unwrap(arr[i])
+      if valid(actor) then
+        local slot=tonumber(actor.SpellData.SlotIndex)
+        local id=assetName(actor.SpellData.SpellId)
+        if slot and slot>=0 and slot<10 and id~='' then values[slot+1]=id end
+      end
+    end
+    out.spell=values
+  end)
+  pcall(function()
+    local values={};for i=1,10 do values[i]='' end
+    local arr=p.MusicComponent.MusicActors
+    for i=1,#arr do
+      local actor=unwrap(arr[i])
+      if valid(actor) then
+        local slot=tonumber(actor.MusicData.SlotIndex)
+        local id=assetName(actor.MusicData.MusicId)
+        if slot and slot>=0 and slot<10 and id~='' then values[slot+1]=id end
+      end
+    end
+    out.music=values
+  end)
+  return out
+end
+local function sameSlots(actual,expected)
+  if not actual then return false end
+  for i=1,#expected do if (actual[i]or'')~=(expected[i]or'') then return false end end
+  return true
+end
+
+local function tick()
+  Mailbox.poll()
+  pcall(applySpeed)
+  local queued=Mailbox.take(S.lastCommandId)
+  if queued then
+    S.lastCommandId=queued.id
+    Mailbox.ack(queued.id,true,'started')
+    local ok,e=pcall(execute,queued.text)
+    pcall(Mailbox.ack,queued.id,ok,e)
+  end
+  if S.travelUntil and os.time()<S.travelUntil then S.hasPlayer=false;S.sample='Waiting for original room load';return end
+  local pc,p=player()
+  S.hasPlayer=p~=nil
+  if not p then S.sample='Waiting for dungeon player';S.uiHp=0;S.uiMaxHp=0;return end
+  if S.classSwitchPending and p.AbilitySystemComponent.bGASInitilized then
+    local actual=tonumber(p.CharacterKey.CharacterClass)
+    S.uiActualClass=actual
+    if actual==S.classSwitchPending.choice then
+      S.action='Selected original '..Classes.names[actual]..' is active'
+      S.classSwitchPending=nil;S.uiError=nil;log(S.action)
+      S.abilityEquipped=nil
+      local classId='Id_PlayerCharacter_'..(Classes.names[actual]or'')
+      pcall(function()local text=Abilities.write(classId);publishModel('panel-abilities.tsv',text);publishModel('panel-ability-slots.tsv',writeAbilitySlots(classId))end)
+    elseif os.time()-S.classSwitchPending.started>=12 then
+      local wanted=S.classSwitchPending.choice
+      local wantedName=Classes.names[wanted]or tostring(wanted)
+      local actualName=Classes.names[actual]or tostring(actual)
+      S.uiError='职业切换未生效：所选 '..wantedName..'，游戏角色仍是 '..actualName
+      S.action=S.uiError;S.classSwitchPending=nil;S.classMismatch=true;log(S.uiError)
+      S.uiResult={id=(S.uiSequence or 0)+1,kind='class',status='error',title='职业切换失败',detail=S.uiError,error=S.uiError}
+      S.uiSequence=(S.uiSequence or 0)+1
+    end
+  elseif p.AbilitySystemComponent.bGASInitilized then
+    local actual=tonumber(p.CharacterKey.CharacterClass)
+    if S.uiActualClass~=actual then
+      S.uiActualClass=actual;S.classMismatch=nil;S.abilityEquipped=nil
+      local classId='Id_PlayerCharacter_'..(Classes.names[actual]or'')
+      pcall(function()local text=Abilities.write(classId);publishModel('panel-abilities.tsv',text);publishModel('panel-ability-slots.tsv',writeAbilitySlots(classId))end)
+    end
+  end
+  if p.AbilitySystemComponent.bGASInitilized then
+   if (S.abilityRecoveryAutoTick or 0)<=0 then
+    local blocked=false
+    if S.autoRecover then blocked=true
+    elseif attackBlocked then
+     local ok,value=pcall(attackBlocked);blocked=ok and value==true
+    end
+    if blocked then
+     S.abilityRecoveryAutoTick=1
+     pcall(recoverAttack,true)
+    else
+     S.abilityRecoveryAutoTick=4
+    end
+   else
+    S.abilityRecoveryAutoTick=(S.abilityRecoveryAutoTick or 0)-1
+   end
+  end
+  ensureGameInfoFallback(pc:GetWorld())
+  local okShape,shapeStatus=pcall(NativeShapeMemory.tick,p)
+  if not okShape then log('native shape memory: '..tostring(shapeStatus)) end
+  pcall(shiftAudit,p)
+  local name=p:GetFullName();local address=p:GetAddress();local hp,max,a=health(p)
+  if S.pawnAddress~=address then
+    Positions.captureEntry(p,Positions.snapshot(p).world..'|world-entry','observed-world-entry')
+    -- Old UE handles belong to the old pawn. Never remove unrelated native effects.
+    local previous=S.pawnAddress;S.pawnAddress=address
+    if S.guardState and S.guardState.address~=address then S.guardState=nil end
+    log('local pawn='..name)
+    S.inventoryCaptured=nil;S.presetPawn=nil;S.loadoutCount=0
+    S.attributeValues=nil
+    if S.attributeTarget then S.attributeTarget.applied=nil end
+    if previous and S.repeatTraining then
+      S.victoryAt=nil;S.observedMonster=nil
+      Runtime.clear(S.monsters);S.monsters={};S.spawnStage=nil
+      S.restartMonster=S.activeMonster;S.replayPending=true
+      S.restoreProgress=nil
+    end
+  end
+  local attributeClass=tonumber(p.CharacterKey.CharacterClass)
+
+  if p.AbilitySystemComponent.bGASInitilized and S.attributeTarget and S.attributeTarget.class==attributeClass then
+    local okNow,nowVals=pcall(Attributes.read,p)
+    local match=false
+    if okNow then
+      match=true
+      for i=1,7 do if math.abs(nowVals[i]-S.attributeTarget.values[i])>0.01 then match=false;break end end
+    end
+    if not match then
+      local okApply,errApply=pcall(Attributes.writePlayer,p,S.attributeTarget.values)
+      if okApply then
+        local okV,vals=pcall(Attributes.read,p)
+        if okV then S.attributeValues=vals;log('ATTR-ENFORCE '..table.concat(vals,',')) end
+      else log('ATTR-ENFORCE-FAIL '..tostring(errApply)) end
+    else
+      S.attributeValues=S.attributePreviewValues or nowVals
+    end
+  end
+  if p.AbilitySystemComponent.bGASInitilized and attributeClass then
+    local ok,values=pcall(Attributes.read,p)
+    if ok then S.attributeValues=S.attributePreviewValues or values end
+    local pending=S.attributePending
+    if pending and pending.class==attributeClass and ok then
+      local matched=true
+      for i=1,7 do if math.abs(values[i]-pending.target[i])>0.01 then matched=false;break end end
+      if matched then
+        S.attributePending=nil;S.uiError=nil
+        S.uiSequence=(S.uiSequence or 0)+1
+        if pending.reset then
+          S.action='基础属性已恢复当前职业默认（本轮已重载）'
+          S.uiResult={id=S.uiSequence,kind='attributes',status='ok',title='基础属性已恢复默认',detail='本轮角色已按原版默认七项基础值初始化。'}
+        else
+          S.action='基础属性已应用（本轮已重载）'
+          S.uiResult={id=S.uiSequence,kind='attributes',status='ok',title='基础属性已应用',detail='本轮角色已按新的七项基础值初始化。'}
+        end
+        log(S.action)
+      elseif os.time()-pending.started>=20 then
+        local detail='重载后读取到的七项基础值未达到目标；职业效果资产可能未被本轮初始化使用。'
+        S.attributePending=nil;S.uiError=detail;S.action=detail
+        S.uiSequence=(S.uiSequence or 0)+1
+        S.uiResult={id=S.uiSequence,kind='attributes',status='error',title='基础属性未生效',detail=detail,error=detail}
+        log(detail)
+      end
+    end
+  end
+
+
+  if p.AbilitySystemComponent.bGASInitilized and attributeClass and S.abilityPending and S.abilityPending.class==attributeClass then
+    local pending=S.abilityPending
+    local snapshot=nativeAbilitySnapshot(p)
+    if sameSlots(snapshot[pending.category],pending.expected) then
+      S.abilityPending=nil;S.uiError=nil
+      S.uiSequence=(S.uiSequence or 0)+1
+      S.action=ABILITY_NAMES[pending.category]..' 已由原版初始化生成（本轮已重载）'
+      S.uiResult={id=S.uiSequence,kind='ability',status='ok',title='能力已由原版初始化生成',detail=ABILITY_NAMES[pending.category]..' 槽位与原版职业行一致。'}
+      log(S.action)
+    elseif os.time()-pending.started>=20 then
+      local detail='重载后原版未生成预期的'..ABILITY_NAMES[pending.category]..'槽位；本轮没有做任何手动授予。'
+      S.abilityPending=nil;S.uiError=detail;S.action=detail
+      S.uiSequence=(S.uiSequence or 0)+1
+      S.uiResult={id=S.uiSequence,kind='ability',status='error',title='原版初始化未生效',detail=detail,error=detail}
+      log(detail)
+    end
+  end
+  if not S.inventoryCaptured and p.AbilitySystemComponent.bGASInitilized and hp and hp>0 then
+    local names=Inventory.capture(p);S.inventoryCaptured=true
+    publishModel('panel-items.tsv',(UI.writeItems(names)))
+    if not Switch.phase or Switch.phase=='idle'or Switch.phase=='adopted'then
+      S.action='Original '..Classes.names[p.CharacterKey.CharacterClass]..' ready; '..#p.EquipmentComponentV2:GetEquippedItemInfos()..' equipped items'
+    end
+    local saved=Inventory.loadLoadout(p)
+    if saved then S.loadoutCount=#saved;if S.repeatTraining then S.replayPending=true end end
+    if loadoutSmoke and not S.loadoutSmokeDone then
+      S.loadoutSmokeDone=true
+      local ok,detail=pcall(function()
+        local count,class=Inventory.savePreset(p,'__smoke__')
+        local records=Inventory.loadPreset(p,'__smoke__')
+        return 'save='..tostring(count)..' class='..tostring(class)..' loaded='..tostring(records and #records)
+      end)
+      log('loadout-smoke '..(ok and detail or tostring(detail)))
+    end
+    if not S.characterResetBaseline or S.characterResetBaseline.address~=address then
+      local lib=StaticFindObject('/Script/GameplayAbilities.Default__AbilitySystemBlueprintLibrary')
+      local getEffect=StaticFindObject('/Script/GameplayAbilities.AbilitySystemBlueprintLibrary:GetGameplayEffectFromActiveEffectHandle')
+      local getGranted=StaticFindObject('/Script/GameplayAbilities.AbilitySystemBlueprintLibrary:GetGameplayEffectGrantedTags')
+      S.characterResetBaseline=CharacterReset.capture(p,{effect=function(h)return getEffect(lib,h)end,name=function(o)return o and o:GetFullName()or''end,transient=function(effect,n)
+       if n:find('/Perk/',1,true)then return false end
+       if n:find('/Skill/',1,true)or n:find('/Spell/',1,true)then return true end
+       local ok,tags=pcall(function()return getGranted(lib,effect:GetClass())end)
+       return ok and CharacterReset.isTransientTags(tags.GameplayTags)
+      end})
+      log('Character reset baseline captured effects='..tostring((function()local n=0;for _ in pairs(S.characterResetBaseline.handles)do n=n+1 end;return n end)()))
+    end
+  end
+  if S.guard and p.AbilitySystemComponent.bGASInitilized then S.guardState=Guard.enable(p,S.guardState)end
+  if S.replayPending and p.AbilitySystemComponent.bGASInitilized and hp and hp>0 and not p.bIsDead then
+    -- Restore only this original class's complete, build-pinned record set.
+    -- The same pawn retains its bag on reset; a new pawn restores once.
+    if S.presetPawn~=address then
+      local records=Inventory.loadLoadout(p)
+      if records then
+        local ok,e=pcall(Inventory.restore,p,records)
+        if not ok then S.action='Loadout restore failed: '..tostring(e);S.replayPending=nil;log(S.action);return end
+        S.loadoutCount=#records;log('Saved loadout items added to bag pawn='..name..' records='..#records)
+      end
+      S.presetPawn=address
+    end
+    local key=S.restartMonster
+    if key then command('spawn '..key)else S.action='Original player restored; training choices retained'end
+    S.replayPending=nil;S.restartMonster=nil
+  end
+  hp,max=health(p)
+  S.sample=string.format('HP %.1f / %.1f | original immune=%s',tonumber(hp)or -1,tonumber(max)or -1,tostring(Guard.has(p)))
+  S.uiHp=hp;S.uiMaxHp=max
+  if S.infiniteStackables and S.inventoryCaptured then pcall(Inventory.infinite,p) end
+  local positionReady,canPosition=pcall(Switch.canResetPositions,p);S.uiCanResetPosition=positionReady and canPosition
+  -- Observe original death only. Training orchestration never writes monster HP.
+  local m=_G.__NATIVE_TRAINING_MONSTER
+  S.uiMonsterHp=nil;S.uiMonsterMaxHp=nil
+  if not S.spawnStage and valid(m) and m.AbilitySystemComponent.bGASInitilized then
+    local mh,mm=health(m)
+    if mh and mm and mm>0 then
+      S.uiMonsterHp=mh;S.uiMonsterMaxHp=mm
+      if mh>0 then S.observedMonster=m:GetAddress()
+      elseif S.repeatTraining and S.observedMonster==m:GetAddress() and not S.victoryAt and not S.deathFailure then
+        S.victoryAt=os.time()+5;S.action='Original monster defeated; next round in 5 seconds';log(S.action)
+      end
+    end
+  end
+  if S.victoryAt and not S.repeatTraining then S.victoryAt=nil end
+  if S.victoryAt and os.time()>=S.victoryAt and hp and hp>0 and not p.bIsDead and not S.deathFailure then command('reset')end
+end
+local function request(raw)ExecuteInGameThread(function()execute(raw);publish()end)end
+-- Existing key callbacks dispatch through this table after a hot reload.
+S.dispatch=function(raw)request(raw)end
+pcall(publish)
+if not S.controlKeysInstalled then
+  RegisterKeyBind(Key.F9,{},function()PanelHotkeys.togglePanel(S);if S.panelVisible and startGui then pcall(startGui)end;publish()end)
+  RegisterKeyBind(Key.F10,{},function()S.dispatch('guard')end)
+  S.controlKeysInstalled=true
+end
+if not S.panelMenuKeysInstalled then
+  local esc=Key and Key.ESCAPE
+  local tab=Key and Key.TAB
+  if esc and tab then
+    local function showPanel()
+      if PanelHotkeys.toggleFromMenuKey(S)~=nil then if S.panelVisible and startGui then pcall(startGui)end;publish()end
+    end
+    local okEsc,eEsc=pcall(RegisterKeyBind,esc,{},showPanel)
+    local okTab,eTab=pcall(RegisterKeyBind,tab,{},showPanel)
+    if okEsc and okTab then S.panelMenuKeysInstalled=true
+    else log('Esc/Tab panel hotkey registration failed: Esc='..tostring(eEsc)..' Tab='..tostring(eTab))end
+  else
+    log('UE4SS Key.ESCAPE/TAB is unavailable; F9 panel hotkey remains active')
+  end
+end
+if not S.shiftStateKeyInstalled then
+  RegisterKeyBind(Key.F8,{},function()S.dispatch('shift-state')end)
+  S.shiftStateKeyInstalled=true
+  log('F8 registered for shape state diagnostics')
+end
+if not S.recoveryKeyInstalled then
+  RegisterKeyBind(Key.F12,{},function()S.dispatch('recover-attack')end)
+  S.recoveryKeyInstalled=true
+  log('F12 registered for released stuck ability recovery; granted abilities are retained')
+end
+if S.controlTimer then Scheduler.cancel(S.controlTimer)end
+S.controlTimer=Scheduler.loop(250,function()
+  if S.generation~=generation then return true end
+  if S.druidLifecycle then
+    local okLife,lifeErr=pcall(S.druidLifecycle.tick,S.druidLifecycle)
+    if not okLife then log('druid lifecycle tick: '..tostring(lifeErr)) end
+    if S.druidLifecycle.lastStage and S.druidLifecycle.lastStage~=S.druidLifecycleStage then
+      S.druidLifecycleStage=S.druidLifecycle.lastStage;log('druid lifecycle stage='..tostring(S.druidLifecycleStage))
+    end
+    if S.druidLifecycle.lastError and S.druidLifecycle.lastError~=S.druidLifecycleError then
+      S.druidLifecycleError=S.druidLifecycle.lastError;log('druid lifecycle error: '..tostring(S.druidLifecycleError))
+    end
+    if S.druidLifecycle.lastContextError and S.druidLifecycle.lastContextError~=S.druidLifecycleContext then
+      S.druidLifecycleContext=S.druidLifecycle.lastContextError;log('druid lifecycle context: '..tostring(S.druidLifecycleContext))
+    end
+    if S.druidLifecycle.lastObservation and S.druidLifecycle.lastObservation~=S.druidLifecycleObservation then
+      S.druidLifecycleObservation=S.druidLifecycle.lastObservation;log('druid lifecycle observe: '..tostring(S.druidLifecycleObservation))
+    end
+  end
+  local ok,e=pcall(tick);if not ok then S.sample=tostring(e)end
+  local published,err=pcall(publish);if not published then log('state publish failed: '..tostring(err))end
+  return false
+end)
+if S.autoHealTimer then Scheduler.cancel(S.autoHealTimer)end
+S.autoHealTimer=Scheduler.loop(1000,function()
+  if S.autoHeal then pcall(autoHeal)end
+  return false
+end)
+if not S.autoArenaScheduled then
+  S.autoArenaScheduled=true
+  local attempts=0
+  Scheduler.loop(1000,function()
+    if S.hasPlayer then return true end
+    if S.travelUntil or S.classSwitchPending then return false end
+    local now=os.clock()
+    if not S.autoArenaStart then S.autoArenaStart=now end
+    if now-S.autoArenaStart<10 then return false end
+    if S.autoArenaNext and now<S.autoArenaNext then return false end
+    attempts=attempts+1
+    if attempts>8 then log('auto arena gave up');return true end
+    S.autoArenaNext=now+3
+    local ok,e=pcall(S.dispatch,'room 1')
+    log('auto arena attempt '..attempts..' ok='..tostring(ok)..' '..tostring(e))
+    return false
+  end)
+end
+publish()
+local run,e=package.loadlib(OUT..BuildProfile.gui,'darkerlab_training_gui_start')
+startGui=run
+if run then run();log('native child panel launch requested')else log('native panel load failed: '..tostring(e))end
+log('controls loaded; F9 panel / F10 guard / auto heal switch; original-only combat')
+
+end
+make_Panel()

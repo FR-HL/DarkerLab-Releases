@@ -1,0 +1,140 @@
+-- The native panel lists the class option arrays from the generated PAK
+-- cache (ui-data.lua), not FindAllOf: the game loads only a small subset of
+-- ability assets, so class scans silently lose most candidates.
+local A={}
+local ROOT=assert(os.getenv('DARKERLAB_ROOT'),'DARKERLAB_ROOT is not set')
+local BUILD=assert(os.getenv('DARKERLAB_GAME_BUILD'),'DARKERLAB_GAME_BUILD is not set')
+local CATS={
+  skill={cls='DCSkillDataAsset',dir='Skill/Skill',options='skills',defaults='Skills',prefix='Skill'},
+  spell={cls='DCSpellDataAsset',dir='Spell/Spell',options='spells',defaults='Spells',prefix='Spell'},
+  perk={cls='DCPerkDataAsset',dir='Perk/Perk',options='perks',defaults='Perks',prefix='Perk'},
+  shift={cls='DCShapeShiftDataAsset',dir='ShapeShift/ShapeShift',options='shapeShifts',defaults='ShapeShifts',prefix='ShapeShift'},
+  music={cls='DCMusicDataAsset',dir='Music/Music',options='musics',defaults='Musics',prefix='Music'},
+}
+local uiData
+local FALLBACK_BUILD='0.18.159.10507'
+local function hasClasses(document)
+  if type(document)~='table'or type(document.classes)~='table'then return false end
+  for _ in pairs(document.classes)do return true end
+  return false
+end
+local function data()
+  if uiData==nil then
+    local ok,loaded=pcall(dofile,ROOT..'/src/build/cache/catalog/profiles/'..BUILD..'/ui-data.lua')
+    if ok and hasClasses(loaded)then
+      uiData=loaded
+    else
+      -- The active build's PlayerCharacter extraction is still empty. Keep the
+      -- last archived class rows so the original-row writer has candidates.
+      local okArchive,archive=pcall(dofile,ROOT..'/archive/legacy-profiles/'..FALLBACK_BUILD..'/ui-data.lua')
+      if okArchive and hasClasses(archive)then
+        archive.class_source='archive:'..FALLBACK_BUILD
+        uiData=archive
+        print('[ABILITIES] class options from archive:'..FALLBACK_BUILD)
+      else
+        uiData=(ok and loaded)or{classes={}}
+      end
+    end
+  end
+  return uiData
+end
+local function text(v)
+  local ok,t=pcall(function()return v:ToString()end)
+  return ok and tostring(t)or''
+end
+local function valid(v)
+  local ok,r=pcall(function()return v and v:IsValid()end)
+  return ok and r==true
+end
+local function idName(id)
+  return id:match('([^_]+)$')or id
+end
+local function assetFor(cat,id)
+  local ok,list=pcall(FindAllOf,cat.cls)
+  if ok and type(list)=='table'then
+    for i=1,#list do
+      local a=list[i]
+      local fn
+      pcall(function()fn=a:GetFullName()end)
+      if fn and fn:match('([^%.]+)$')==id then return a end
+    end
+  end
+  local path='/Game/DungeonCrawler/Data/Generated/V2/'..cat.dir..'/'..id..'.'..id
+  local okLoad,loaded=pcall(LoadAsset,path)
+  if okLoad and valid(loaded)then return loaded end
+end
+local function rowFor(cat,id,classId)
+  local asset=assetFor(cat,id)
+  local name=asset and text(asset.Name)or''
+  if name==''then name=idName(id)end
+  local tier=0
+  if asset then
+    pcall(function()tier=tonumber(asset.SpellTier)or tonumber(asset.SkillTier)or 0 end)
+  end
+  return{id=id,name=name,classes=classId or'',path=cat.dir,tier=tier}
+end
+local function loadedRows(key,cat,classId)
+  local out={}
+  local ok,list=pcall(FindAllOf,cat.cls)
+  if ok and type(list)=='table'then
+    for i=1,#list do
+      local a=list[i];local fn
+      pcall(function()fn=a:GetFullName()end)
+      local id=fn and fn:match('([^%.]+)$')or''
+      if id~=''then out[#out+1]=rowFor(cat,id,classId)end
+    end
+  end
+  return out
+end
+
+-- Returns the option rows for the current class. The class PAK arrays are
+-- the source of truth for candidate IDs; ui-data keeps those arrays for the
+-- fixed build.
+function A.rows(classId)
+  local out={}
+  local class=classId and data().classes[classId]or nil
+  for key,cat in pairs(CATS)do
+    local rows={}
+    if class and class.options and type(class.options[cat.options])=='table'and#class.options[cat.options]>0 then
+      for _,id in ipairs(class.options[cat.options])do
+        if type(id)=='string'then rows[#rows+1]=rowFor(cat,id,classId)end
+      end
+    elseif not classId then
+      rows=loadedRows(key,cat,classId)
+    end
+    table.sort(rows,function(a,b)return a.name<b.name end)
+    out[key]=rows
+  end
+  return out
+end
+
+-- Default equipped arrays from the class asset. These are the initial slot
+-- contents shown in the slot editor; they are not the full option list.
+function A.defaults(classId)
+  local out={}
+  local class=classId and data().classes[classId]or nil
+  for key,cat in pairs(CATS)do
+    local values={}
+    if class then
+      for _,id in ipairs((class.arrays and class.arrays[cat.defaults])or{})do
+        if type(id)=='string'then values[#values+1]=id end
+      end
+    end
+    out[key]=values
+  end
+  return out
+end
+
+-- Format: <cat>\t<allowed>\t<classIds>\t<name>\t<id>\t<tier>
+function A.write(classId)
+  local catalogue=A.rows(classId)
+  local out={'#schema=1','class='..tostring(classId or'')}
+  for _,key in ipairs({'skill','spell','perk','shift','music'})do
+    for _,row in ipairs(catalogue[key])do
+      out[#out+1]=key..'\t1\t'..row.classes..'\t'..row.name..'\t'..row.id..'\t'..tostring(row.tier or 0)
+    end
+  end
+  return table.concat(out,'\n')..'\n',catalogue
+end
+
+return A

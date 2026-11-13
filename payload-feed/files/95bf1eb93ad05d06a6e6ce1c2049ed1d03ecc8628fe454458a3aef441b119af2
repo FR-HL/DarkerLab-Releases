@@ -1,0 +1,435 @@
+-- Domain module. Generated from the old single-purpose Lua modules.
+local ROOT=assert(os.getenv('DARKERLAB_ROOT'),'DARKERLAB_ROOT is not set')
+local MOD=_G.__DARKERLAB_MOD_DIR or (ROOT..'/game/'..(os.getenv('DARKERLAB_GAME_COPY') or 'Dark and Darker-NoAC')..'/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/scripts/')
+local function loadDomain(name)
+ local cache=_G.__DARKERLAB_DOMAIN_CACHE or {};_G.__DARKERLAB_DOMAIN_CACHE=cache
+ if not cache[name] then cache[name]=dofile(MOD..name..'.lua') end
+ return cache[name]
+end
+local Core=loadDomain('core')
+local Mailbox=loadDomain('panel_runtime')
+local NativeLoadout=loadDomain('native_loadout')
+local function make_Classes()
+local ROOT=assert(os.getenv('DARKERLAB_ROOT'),'DARKERLAB_ROOT is not set')
+-- Choose original tutorial inputs before its first native player initialization.
+local C={}
+local function resolveGameRoot()
+  local explicit=os.getenv('DARKERLAB_GAME_PATH')
+  if explicit and explicit~='' then return (explicit:gsub('\\','/'):gsub('/+$','')) end
+  return ROOT..'/game/'..(os.getenv('DARKERLAB_GAME_COPY') or 'Dark and Darker-NoAC')
+end
+local GAME_ROOT=_G.__DARKERLAB_GAME_ROOT or resolveGameRoot()
+_G.__DARKERLAB_GAME_ROOT=GAME_ROOT
+local MOD=GAME_ROOT..'/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/'
+local OUT=ROOT..'/src/build/output/native/'
+C.names={'Wizard','Rogue','Ranger','Fighter','Cleric','Barbarian','Bard','Warlock','Druid','Sorcerer'}
+local S=_G.__DARKERLAB_NATIVE_CLASSES or {}
+_G.__DARKERLAB_NATIVE_CLASSES=S
+if _G.__DARKERLAB_FIRST_CLASS_TEST then _G.__DARKERLAB_FIRST_CLASS_TEST.enabled=false end
+local function valid(v)local ok,r=pcall(function()return v and v:IsValid()end);return ok and r==true end
+local function log(s)print('[NATIVE-CLASS] '..tostring(s))end
+if not S.choice then
+ local done=false
+ Mailbox.submit('GET','/api/profile/class','',function(status,body)
+  local index=status==200 and tonumber(body:match('^(%d+)')) or nil
+  if index and C.names[index] then S.choice=index end
+  done=true
+ end)
+ Mailbox.wait(0.3,function()return done end)
+end
+if not C.names[S.choice]then S.choice=4 end
+function C.selected()return S.choice,C.names[S.choice]end
+function C.select(choice)
+ assert(C.names[choice],'Unknown original class')
+ S.choice=choice
+ local okLoad,report=pcall(NativeLoadout.apply,choice)
+ if not okLoad then S.lastApplyError='native loadout: '..tostring(report);log(S.lastApplyError)
+ elseif report and report.applied then log('native loadout row='..tostring(report.class))end
+ Mailbox.submit('POST','/api/profile/class?index='..tostring(choice),'',function(status,body)
+  if status~=200 then log('training class persistence failed: '..tostring(body)) end
+ end)
+ return C.names[choice]
+end
+function C.apply(mode)
+ assert(valid(mode)and mode:GetFullName():find('BP_GameModeTutorial_C ',1,true),'Not local tutorial mode')
+ local n=require('UEHelpers').FindOrAddFName
+ local class=C.names[S.choice];assert(class,'Invalid selected class')
+ mode.TutorialLoadoutClassId={PrimaryAssetType={Name=n('DesignDataPlayerCharacter')},PrimaryAssetName=n('Id_PlayerCharacter_'..class)}
+ local run,e=package.loadlib(OUT..'training_core.dll','native_training_select_class_direct');assert(run,e)
+ local bound=run(mode:GetAddress(),S.choice)
+ assert(bound==1,'Native class getter rejected this game build')
+ S.lastApplyError=nil;S.lastAppliedChoice=S.choice
+ log('original initialization inputs class='..class..' mode='..mode:GetFullName()..' bind=ok')
+ return true
+end
+S.beforeInit=function(context)
+ local ok,e=pcall(function()
+  local yes,v=pcall(function()return context:get()end);local mode=yes and v or context
+  if valid(mode)and mode:GetFullName():find('BP_GameModeTutorial_C ',1,true)then
+   local applied,reason=C.apply(mode);if applied==false then error(S.lastApplyError or reason or'class binding rejected')end
+   -- Write the original class row before the original player initializer runs.
+   -- A missing/failed write never blocks class binding; it is reported instead.
+   local okLoad,report=pcall(NativeLoadout.apply,S.choice)
+   if okLoad then
+    if report and report.applied then log('native loadout row='..tostring(report.class)..' path='..tostring(report.path))end
+   else
+    S.lastApplyError='native loadout: '..tostring(report)
+    log(S.lastApplyError)
+   end
+  end
+ end)
+ if not ok then log('UNKNOWN '..tostring(e))end
+end
+if not S.installed then
+ if type(RegisterInitGameStatePreHook)~='function' then print('[CAMP] InitGameState hook unavailable; class pre-init skipped');return end
+ RegisterInitGameStatePreHook(function(context)S.beforeInit(context)end);S.installed=true
+end
+return C
+
+end
+local Classes=make_Classes()
+local function make_Attributes()
+local A={}
+A.names={'Strength','Vigor','Agility','Dexterity','Will','Knowledge','Resourcefulness'}
+A.labels={'力量','活力','敏捷','灵巧','意志','知识','智谋'}
+A.MIN=1
+A.MAX=99
+local V1='/Game/DungeonCrawler/Data/Generated/DT_PlayerCharacter/PlayerCharacterEffect/'
+local V2='/Game/DungeonCrawler/Data/Generated/V2/PlayerCharacter/PlayerCharacterEffect/'
+
+local function unwrap(v)
+ local ok,r=pcall(function()return v:get()end)
+ return ok and r or v
+end
+local function valid(v)
+ local ok,r=pcall(function()return v and v:IsValid()end)
+ return ok and r==true
+end
+local function loadAsset(path)
+ local asset=StaticFindObject(path)
+ if valid(asset)then return asset end
+ local ok,loaded=pcall(LoadAsset,path)
+ if ok and valid(loaded)then return loaded end
+end
+local function itemOf(asset)
+ if not valid(asset)then return end
+ local item=asset.Item
+ if item then
+  local ok,value=pcall(function()return item:get()end)
+  if ok and type(value)=='table'then item=value end
+ end
+ return item
+end
+function A.find(p)
+ local asc=p and p.AbilitySystemComponent
+ if not asc or not asc.SpawnedAttributes then return nil end
+ for i=1,#asc.SpawnedAttributes do
+  local a=unwrap(asc.SpawnedAttributes[i])
+  if valid(a)and a:GetClass():GetFName():ToString()=='DCAttributeSet'then return a end
+ end
+end
+function A.read(p)
+ local set=A.find(p)
+ assert(set,'Attribute: 当前角色没有 DCAttributeSet')
+ local values={}
+ for i,name in ipairs(A.names)do
+  local field=set[name..'Base']
+  local derived=set[name]
+  local value
+  if derived then local okd,d=pcall(function()return tonumber(derived.CurrentValue)end);if okd then value=d end end
+  if value==nil and field then local okf,f=pcall(function()return tonumber(field.BaseValue)end);if okf then value=f end end
+  assert(value,'Attribute: '..name..' 无法读取')
+  values[i]=value
+ end
+ return values,set
+end
+function A.validate(values)
+ assert(type(values)=='table'and #values==#A.names,'Attribute value: 需要七项整数')
+ for i=1,#A.names do
+  local v=tonumber(values[i])
+  assert(v and v==math.floor(v),'Attribute value: '..A.labels[i]..' 必须是整数')
+  assert(v>=A.MIN and v<=A.MAX,'Attribute value: '..A.labels[i]..' 必须在 '..A.MIN..'-'..A.MAX..' 之间')
+ end
+end
+function A.effectAssets(name)
+ assert(type(name)=='string'and name:match('^[%w_]+$'),'Attribute: 职业效果名无效')
+ local v1=loadAsset(V1..name..'.'..name)
+ local v2=loadAsset(V2..name..'.'..name)
+ return v1,v2
+end
+function A.readEffect(name,fallback)
+ local v1,v2=A.effectAssets(name)
+ local item=itemOf(v1)
+ local values={}
+ for i,field in ipairs(A.names)do
+  local value
+  if valid(v2)then local ok,r=pcall(function()return v2[field..'Base']end);if ok then value=r end end
+  if value==nil and item then local ok,r=pcall(function()return item[field..'Base']end);if ok then value=r end end
+  if value==nil and fallback then value=fallback[i]end
+  values[i]=tonumber(value)
+  assert(values[i],'Attribute: '..name..' 的 '..field..'Base 无法读取')
+ end
+ return values,v1,v2
+end
+local function propertyOf(object,name)
+ local prop
+ if not valid(object)then return end
+ object:GetClass():ForEachProperty(function(candidate)if candidate:GetFName():ToString()==name then prop=candidate end end)
+ return prop
+end
+function A.writeEffect(name,values)
+ A.validate(values)
+ local v1,v2=A.effectAssets(name)
+ assert(valid(v1)or valid(v2),'Attribute: '..name..' 的初始化效果资产不可用')
+ local wrote=false
+ for _,asset in ipairs({v1,v2})do
+  if valid(asset)then
+   for i,field in ipairs(A.names)do
+    local prop=propertyOf(asset,field..'Base')
+    if prop then
+     local pointer=prop:ContainerPtrToValuePtr(asset,0)
+     local ok=pcall(function()prop:ImportText(tostring(values[i]),pointer,0,asset)end)
+     wrote=wrote or ok
+    end
+   end
+  end
+ end
+ assert(wrote,'Attribute: '..name..' 的初始化效果写入失败')
+ local function baseOf(asset)
+  if not valid(asset)then return 'nil' end
+  local ok,r=pcall(function()return asset.StrengthBase end)
+  return ok and tostring(r)or'ERR'
+ end
+ return v1,v2
+end
+function A.writePlayer(p,values)
+ A.validate(values)
+ local set=A.find(p)
+ assert(set,'Attribute: 当前角色没有 DCAttributeSet')
+ for i,name in ipairs(A.names)do
+  local baseField=set[name..'Base']
+  local derived=set[name]
+  local mod=0
+  local modField=set[name..'Mod']
+  if modField then local okm,m=pcall(function()return tonumber(modField.CurrentValue)end);if okm and m then mod=m end end
+  if derived then
+   pcall(function()derived.BaseValue=values[i]end)
+   pcall(function()derived.CurrentValue=values[i]+mod end)
+  end
+  if baseField then
+   local oldBase=tonumber(baseField.BaseValue)or 0
+   local oldCurrent=tonumber(baseField.CurrentValue)
+   local bonus=(oldCurrent or oldBase)-oldBase
+   pcall(function()baseField.BaseValue=values[i]end)
+   if oldCurrent~=nil then pcall(function()baseField.CurrentValue=values[i]+bonus end)end
+  end
+ end
+ return A.read(p)
+end
+return A
+
+end
+local Attributes=make_Attributes()
+local function make_Guard()
+-- Own only the original GameplayEffect handles created by this module.
+local G={}
+-- Keep ownership across module reloads and panel/respawn callback ordering.
+local owned=_G.__DARKERLAB_OWNED_GUARDS or {}
+_G.__DARKERLAB_OWNED_GUARDS=owned
+local function key(p)return tostring(p:GetAddress())..' '..p:GetFullName()end
+local function unwrap(v)local ok,r=pcall(function()return v:get()end);return ok and r or v end
+local function api()
+ local lib=StaticFindObject('/Script/DungeonCrawler.Default__DCAbilitySystemBlueprintLibrary')
+ local has=StaticFindObject('/Script/DungeonCrawler.DCAbilitySystemBlueprintLibrary:HasMatchingGameplayTag')
+ local name=require('UEHelpers').FindOrAddFName
+ return lib,has,name,{TagName=name('State.Immune.Damage')}
+end
+function G.has(p)local lib,has,_,tag=api();return has(lib,p,tag)end
+function G.enable(p,state)
+ local identity=key(p)
+ state=owned[identity]or state
+ if state and state.address==p:GetAddress()and G.has(p)then return state end
+ local lib,has,name,tag=api()
+ local result={address=p:GetAddress(),preexisting=has(lib,p,tag),handles={}}
+ if result.preexisting then return result end
+ local apply=StaticFindObject('/Script/DungeonCrawler.DCAbilitySystemBlueprintLibrary:ApplyGameplayEffectByIds')
+ local returned=apply(lib,p,{{PrimaryAssetType={Name=name('DesignDataGameplayEffect')},PrimaryAssetName=name('Id_MonsterEffect_Lib_Immune_Damage')}},p)
+ for i=1,#returned do
+  local h=unwrap(returned[i]);assert(type(h.Handle)=='number' and h.Handle>0,'Original effect returned invalid handle')
+  result.handles[#result.handles+1]={Handle=h.Handle}
+ end
+ assert(#result.handles>0 and has(lib,p,tag),'Original immunity did not activate')
+ owned[identity]=result
+ return result
+end
+function G.disable(p,state)
+ local identity=key(p)
+ state=owned[identity]or state
+ if not state or state.address~=p:GetAddress()then return nil end
+ for _,h in ipairs(state.handles)do
+  assert(p.AbilitySystemComponent:RemoveActiveGameplayEffect(h,-1),'Owned original immunity removal failed')
+ end
+ owned[identity]=nil
+ return nil
+end
+return G
+
+end
+local Guard=make_Guard()
+local function make_AbilityRecovery()
+-- Explicit recovery for a player ability that has released its input but still
+-- keeps the original attack-disabled state. Cancels active instances; never
+-- removes the granted ability spec.
+local R={}
+
+-- Read the shipped design-data reference. Ability names are not a reliable
+-- source for effect IDs and Lua patterns do not support regex alternation.
+function R.cooldownAsset(data)
+ local ok,effect=pcall(function()
+  local id=data.SkillCooldownEffect
+  local kind=id.PrimaryAssetType.Name:ToString()
+  local name=id.PrimaryAssetName:ToString()
+  if kind~='DesignDataGameplayEffect'or name==''or name=='None'then return nil end
+  return id
+ end)
+ return ok and effect or nil
+end
+
+local function unwrap(v)
+ local ok,result=pcall(function()return v:get()end)
+ return ok and result or v
+end
+
+local function eachArray(array,fn)
+ local ok,count=pcall(function()return #array end)
+ if not ok or type(count)~='number'then return false end
+ count=math.min(count,512)
+ for i=1,count do
+  local got,value=pcall(function()return array[i]end)
+  if got then fn(value,i)end
+ end
+ return true
+end
+
+function R.recover(specs,attackBlocked,env)
+ local arrayType=type(specs)
+ assert(arrayType=='table'or arrayType=='userdata','Ability specs unavailable')
+ assert(type(env)=='table'and type(env.valid)=='function'and type(env.name)=='function'and type(env.cancel)=='function'and type(env.cooldown)=='function','Recovery adapter incomplete')
+ local result={status='no_candidate',ended=0,cancelled=0,failed=0,preserved=0,deferred=0,cooldownApplied=0,cooldownFailed=0}
+ local seen={}
+ eachArray(specs,function(raw)
+  local spec=unwrap(raw)
+  local ability=unwrap(spec.Ability)
+  local abilityName=env.name(ability)
+  local active=tonumber(spec.ActiveCount)or 0
+  -- A pressed ability may be an intentional channel or hold action. Passive
+  -- grants also remain active by design and are never candidates.
+  local lowerName=abilityName:lower()
+  -- F12 is an explicit recovery request. A stale Skill/Spell must be
+  -- recoverable even when it did not leave the attack-disabled tag behind
+  -- (Rupture is the known example). Held/channelled abilities stay intact.
+  if active>0 and spec.InputPressed~=true and (lowerName:find('/skill/',1,true)or lowerName:find('/spell/',1,true))and not lowerName:find('passive',1,true)then
+   for _,arrayName in ipairs({'NonReplicatedInstances','ReplicatedInstances'})do
+    local instances=spec[arrayName]
+    if instances~=nil then
+     eachArray(instances,function(rawInstance)
+      local instance=unwrap(rawInstance)
+      if env.valid(instance)then
+       local identity=env.identity and env.identity(instance)or tostring(instance)
+       if not seen[identity]then
+        seen[identity]=true
+        local stale=true
+        if env.stale then
+         local ok,value=pcall(env.stale,instance,abilityName,spec)
+         stale=ok and value==true
+        end
+        if not stale then
+         result.deferred=result.deferred+1
+        else
+        local cdOk,cdErr=pcall(env.cooldown,instance,abilityName)
+        if cdOk and cdErr~=false then
+         result.cooldownApplied=result.cooldownApplied+1
+         local ended=false
+         if env.finish then
+          local endOk,endErr=pcall(env.finish,instance,spec)
+          ended=endOk and endErr~=false and (tonumber(spec.ActiveCount)or 0)==0
+         end
+         if ended then
+          result.ended=result.ended+1;result.status='recovered'
+         else
+          local ok,err=pcall(env.cancel,instance)
+          if ok then result.cancelled=result.cancelled+1;result.status='recovered'
+          else result.failed=result.failed+1;result.lastError=tostring(err)end
+         end
+        else
+         result.cooldownFailed=result.cooldownFailed+1;result.lastError=tostring(cdErr or 'cooldown unavailable')
+        end
+        end
+       end
+      end
+     end)
+    end
+   end
+  elseif active>0 and abilityName:lower():find('passive',1,true)then
+   result.preserved=result.preserved+1
+  end
+ end)
+ if result.status=='no_candidate' and not attackBlocked then result.status='not_blocked' end
+ return result
+end
+
+return R
+
+end
+local AbilityRecovery=make_AbilityRecovery()
+local function make_CharacterReset()
+-- Reset transient state on the current player pawn. Persistent original
+-- equipment/perk effects are retained through a per-pawn baseline.
+local R={}
+local function unwrap(v)local ok,r=pcall(function()return v:get()end);return ok and r or v end
+local function each(a,fn)for i=1,math.min(#a,512)do fn(unwrap(a[i]))end end
+function R.isTransientTags(tags)
+ for _,raw in ipairs(tags or{})do
+  local ok,value=pcall(function()return raw.TagName:ToString()end);local name=ok and value or''
+  if name=='Type.Effect.Cooldown'or name=='Type.ActorStatus.Buff.Removable'or name=='Type.ActorStatus.Debuff.Removable'or name:find('State.Character.Skill.Cooldown.',1,true)==1 then return true end
+ end
+ return false
+end
+
+function R.capture(p,env)
+ local baseline={address=p:GetAddress(),handles={}}
+ each(p.AbilitySystemComponent:GetActiveEffects({}),function(h)
+  local effect=env.effect(h);local name=env.name(effect)
+  if not env.transient(effect,name)then baseline.handles[h.Handle]=true end
+ end)
+ return baseline
+end
+
+function R.reset(p,baseline,env)
+ assert(baseline and baseline.address==p:GetAddress(),'Character state baseline unavailable')
+ local asc=unwrap(p.AbilitySystemComponent);local result={abilities=0,ownedEffects=0,transientEffects=0,localState=false}
+ local seen={}
+ each(asc.ActivatableAbilities.Items,function(spec)
+  local ability=unwrap(spec.Ability);local abilityName=env.name(ability):lower()
+  if (tonumber(spec.ActiveCount)or 0)>0 and not abilityName:find('passive',1,true)then
+   for _,field in ipairs({'NonReplicatedInstances','ReplicatedInstances'})do each(spec[field],function(instance)
+    if env.valid(instance)and not seen[instance:GetAddress()]then
+     seen[instance:GetAddress()]=true
+     each(instance.ActiveEffectHandles or{},function(h)if type(h.Handle)=='number'and h.Handle>0 and asc:RemoveActiveGameplayEffect({Handle=h.Handle},-1)then result.ownedEffects=result.ownedEffects+1 end end)
+     env.cancel(instance);result.abilities=result.abilities+1
+    end
+   end)end
+  end
+ end)
+ local preserve=env.preserveHandles()
+ local remove={}
+ each(asc:GetActiveEffects({}),function(h)if not baseline.handles[h.Handle]and not preserve[h.Handle]then remove[#remove+1]=h.Handle end end)
+ for _,id in ipairs(remove)do if asc:RemoveActiveGameplayEffect({Handle=id},-1)then result.transientEffects=result.transientEffects+1 end end
+ env.removeLocalState(p);result.localState=true
+ return result
+end
+return R
+
+end
+local CharacterReset=make_CharacterReset()
+return {classes=Classes, attributes=Attributes, guard=Guard, ability_recovery=AbilityRecovery, character_reset=CharacterReset}

@@ -1,0 +1,27 @@
+-- Simple panel commands with no Unreal object access. Complex actions stay in panel.lua.
+local M = {}
+
+function M.simple(raw, state, startGui, switchboard)
+  if raw == "panel-hide" then state.panelVisible = false; return true end
+  if raw == "panel-show" then
+    state.panelVisible = true
+    if startGui then pcall(startGui) end
+    return true
+  end
+  if raw == "panel-menu-keys on" or raw == "panel-menu-keys off" then
+    state.panelOnMenuKeys = raw == "panel-menu-keys on"
+    state.action = "Esc / Tab panel sync " .. (state.panelOnMenuKeys and "enabled" or "disabled")
+    return true
+  end
+  local scene = raw:match("^scene (current)$") or raw:match("^scene (original)$")
+  if scene then
+    assert(not (switchboard and switchboard.pending), "Wait for the current selection before changing scene mode")
+    state.sceneMode = scene
+    state.roomReady = false
+    state.action = scene == "current" and "下次在当前场地生成，玩家不传送" or "下次加载对应原版场地"
+    return true
+  end
+  return false
+end
+
+return M

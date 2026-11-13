@@ -1,0 +1,563 @@
+const fs = require("node:fs");
+const profileDb = require("./profile_db.js");
+const { DC } = require("./proto_runtime.js");
+const P = DC.Packet;
+const encode = (type, value) => type.encode(value).finish();
+
+// Order matches the persisted class index used by the training panel.
+const TRAINING_CLASSES = Object.freeze([
+  "Wizard", "Rogue", "Ranger", "Fighter", "Cleric",
+  "Barbarian", "Bard", "Warlock", "Druid", "Sorcerer",
+]);
+const LOBBY_CLASSES = Object.freeze([
+  "Fighter", "Barbarian", "Rogue", "Ranger", "Wizard",
+  "Cleric", "Bard", "Druid", "Warlock", "Sorcerer",
+]);
+const OPTION_FIELDS = Object.freeze({ perks: "Perks", skills: "Skills", spells: "Spells", musics: "Musics", shapeShifts: "ShapeShifts" });
+const EQUIP_TYPES = Object.freeze({ perks: 1, skills: 2, spells: 3, musics: 4, shapeShifts: 5 });
+const SLOT_CATEGORIES = Object.freeze({ 1: "perks", 2: "skills", 3: "spells", 4: "musics", 5: "shapeShifts" });
+
+function buildClassListBody(classIds = LOBBY_CLASSES) {
+  if (!Array.isArray(classIds) || classIds.length === 0) throw new TypeError("classIds must be a non-empty array");
+  if (new Set(classIds).size !== classIds.length) throw new Error("duplicate class id");
+  return encode(P.SS2C_ACCOUNT_CHARACTER_CLASS_LIST_NOT, {
+    characterClassList: classIds.map((id) => {
+      if (typeof id !== "string" || !/^[A-Za-z][A-Za-z0-9]*$/.test(id)) throw new Error(`invalid class id: ${id}`);
+      // Do not add the old fabricated DesignDataShop:Id_*_Shop reference.
+      return { characterClassId: `DesignDataPlayerCharacter:Id_PlayerCharacter_${id}`, isOwned: 1 };
+    })
+  });
+}
+
+function normalizeClassName(value) {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  const nested = trimmed.match(/(?:^|[:./])(?:Id_PlayerCharacter_)?([A-Za-z][A-Za-z0-9]*)$/);
+  if (!nested) return null;
+  const name = nested[1];
+  return TRAINING_CLASSES.includes(name) ? name : null;
+}
+
+function classRef(className) {
+  const normalized = normalizeClassName(className);
+  if (!normalized) throw new Error(`invalid class name: ${className}`);
+  return `DesignDataPlayerCharacter:Id_PlayerCharacter_${normalized}`;
+}
+
+function cloneArray(value) {
+  return Array.isArray(value) ? value.slice() : [];
+}
+
+function defaultLayout(equipped) {
+  const result = { spells: [], musics: [], shapeShifts: [] };
+  for (const category of Object.keys(result)) {
+    result[category] = cloneArray(equipped[category]).map((id, sequenceIndex) => ({
+      id,
+      slotIndex: 0,
+      sequenceIndex,
+    }));
+  }
+  return result;
+}
+
+function normalizeLayout(layout, equipped) {
+  const defaults = defaultLayout(equipped);
+  const result = {};
+  for (const category of Object.keys(defaults)) {
+    const rows = Array.isArray(layout?.[category]) ? layout[category] : defaults[category];
+    const known = new Set(equipped[category]);
+    const normalized = [];
+    for (const row of rows) {
+      if (!row || typeof row !== "object") continue;
+      const id = row.id ?? row.spellId ?? row.musicId ?? row.shapeShiftId;
+      if (typeof id !== "string" || !known.has(id)) continue;
+      normalized.push({
+        id,
+        slotIndex: Number.isInteger(row.slotIndex) ? row.slotIndex : 0,
+        sequenceIndex: Number.isInteger(row.sequenceIndex) ? row.sequenceIndex : normalized.length,
+      });
+    }
+    // Keep every equipped item exactly once; malformed/old profiles fall back
+    // to the PAK default order instead of silently dropping a selection.
+    for (const id of equipped[category]) {
+      if (!normalized.some((row) => row.id === id)) {
+        normalized.push({ id, slotIndex: 0, sequenceIndex: normalized.length });
+      }
+    }
+    normalized.sort((a, b) => a.sequenceIndex - b.sequenceIndex || a.slotIndex - b.slotIndex);
+    normalized.forEach((row, index) => { row.sequenceIndex = index; });
+    result[category] = normalized;
+  }
+  return result;
+}
+
+function profileFromClass(classProfile, className, nickname, gender, build) {
+  const equipped = {};
+  for (const category of Object.keys(OPTION_FIELDS)) equipped[category] = cloneArray(classProfile.equipped[category]);
+  return {
+    version: 1,
+    build: build || "",
+    characterId: "1",
+    nickname: nickname || "OfflinePlayer",
+    className,
+    gender: Number.isInteger(gender) ? gender : 0,
+    equipped,
+    layout: defaultLayout(equipped),
+  };
+}
+
+function loadCharacterProfile(root, build = "", characterId = "1") {
+  const raw = profileDb.getCharacter(root, characterId);
+  if (!raw) return null;
+  const className = normalizeClassName(raw.className);
+  if (!className || !raw.equipped) return null;
+  if (build && raw.build && raw.build !== build) return null;
+  const equipped = {};
+  for (const category of Object.keys(OPTION_FIELDS)) equipped[category] = cloneArray(raw.equipped[category]);
+  return {
+    version: 1,
+    build: raw.build || build,
+    characterId: raw.characterId || "1",
+    nickname: raw.nickname || "OfflinePlayer",
+    className,
+    gender: Number.isInteger(raw.gender) ? raw.gender : 0,
+    trainingClassIndex: raw.trainingClassIndex,
+    equipped,
+    layout: normalizeLayout(raw.layout, equipped),
+  };
+}
+
+function saveCharacterProfile(root, profile) {
+  const persisted = { ...profile };
+  delete persisted.options;
+  profileDb.saveCharacter(root, persisted);
+}
+
+function deleteCharacterProfile(root, characterId = "1") {
+  profileDb.deleteCharacter(root, characterId);
+}
+
+function loadProfiles(filePath) {
+  const document = JSON.parse(fs.readFileSync(filePath, "utf8"));
+  if (!document || document.source !== "current_pak_original_fields" || !document.classes) {
+    throw new Error("class profile cache is not current PAK original-field data");
+  }
+  const result = {};
+  for (const classId of TRAINING_CLASSES) {
+    const row = document.classes[`Id_PlayerCharacter_${classId}`];
+    if (!row || !row.arrays) throw new Error(`class profile missing from current PAK cache: ${classId}`);
+    const profile = { classId, name: row.name, options: {}, equipped: {} };
+    for (const [outputKey, sourceKey] of Object.entries(OPTION_FIELDS)) {
+      const equipped = row.arrays[sourceKey] ?? [];
+      const choices = row.options?.[outputKey] ?? equipped;
+      for (const [label, values] of [["equipped", equipped], ["options", choices]]) {
+        if (!Array.isArray(values) || values.some((id) => typeof id !== "string" || !/^Id_[A-Za-z0-9_]+$/.test(id))) {
+          throw new Error(`invalid ${sourceKey} ${label} IDs for ${classId}`);
+        }
+      }
+      profile.equipped[outputKey] = equipped.slice();
+      profile.options[outputKey] = choices.slice();
+    }
+    result[classId] = profile;
+  }
+  return result;
+}
+
+function selectedClass(root, characterId = "1") {
+  const saved = loadCharacterProfile(root, process.env.DARKERLAB_GAME_BUILD || "", characterId);
+  return saved ? saved.className : "Fighter";
+}
+
+function trainingClass(root, characterId = "1") {
+  const index = profileDb.getTrainingClass(root, characterId);
+  return { index, name: TRAINING_CLASSES[index - 1] ?? "Fighter" };
+}
+
+function setTrainingClass(root, index, characterId = "1") {
+  profileDb.setTrainingClass(root, index, characterId);
+  return trainingClass(root, characterId);
+}
+
+function listLoadouts(root, classIndex, characterId = "1") { return profileDb.listLoadouts(root, classIndex, characterId); }
+function getLoadout(root, classIndex, name, characterId = "1") { return profileDb.getLoadout(root, classIndex, name, characterId); }
+function saveLoadout(root, loadout) { return profileDb.saveLoadout(root, loadout); }
+function deleteLoadout(root, classIndex, name, characterId = "1") { return profileDb.deleteLoadout(root, classIndex, name, characterId); }
+
+function buildOptionListBody(profile, category) {
+  if (!profile || !profile.options || !Object.hasOwn(OPTION_FIELDS, category)) throw new Error(`unsupported class option category: ${category}`);
+  const ids = profile.options[category];
+  if (!Array.isArray(ids)) throw new Error(`missing ${category} options`);
+  if (category === "perks" || category === "skills") {
+    const equipped = new Set(profile.equipped[category]);
+    const remaining = ids.filter((id) => !equipped.has(id));
+    if (category === "perks") {
+      return encode(P.SS2C_CLASS_PERK_LIST_RES, { perks: remaining.map((perkId, index) => ({ index, perkId })) });
+    }
+    return encode(P.SS2C_CLASS_SKILL_LIST_RES, { skills: remaining.map((skillId, index) => ({ index, skillId })) });
+  }
+  const selected = new Set(profile.equipped[category]);
+  const rows = layoutRows(profile, category).map(({ id, slotIndex, sequenceIndex }) => ({
+    id, slotIndex, sequenceIndex,
+  }));
+  for (const id of ids) {
+    if (!selected.has(id)) rows.push({ id, slotIndex: 0xFFFFFFFF, sequenceIndex: 0xFFFFFFFF });
+  }
+  if (category === "spells") {
+    return encode(P.SS2C_CLASS_SPELL_LIST_RES, { spells: rows.map(({ id, slotIndex, sequenceIndex }) => ({ slotIndex, sequenceIndex, spellId: id })) });
+  }
+  if (category === "musics") {
+    return encode(P.SS2C_CLASS_MUSIC_LIST_RES, { musics: rows.map(({ id, slotIndex, sequenceIndex }) => ({ musicId: id, slotIndex, sequenceIndex })) });
+  }
+  return encode(P.SS2C_CLASS_SHAPESHIFT_LIST_RES, { shapeShifts: rows.map(({ id, slotIndex, sequenceIndex }) => ({ shapeShiftId: id, slotIndex, sequenceIndex })) });
+}
+
+// Local lobby equipment. The client uses item IDs and slot IDs to build the
+// character preview and its base stats; an empty list leaves the default
+// unclothed model with every stat at zero.
+function starterItems(profile) {
+  const common = [
+    { id: "Id_Item_ArmingSword_1001", slot: 10, properties: [["Id_ItemPropertyType_Effect_PhysicalWeaponDamage", 26]] },
+    { id: "Id_Item_AdventurerTunic_1001", slot: 2, properties: [["Id_ItemPropertyType_Effect_ArmorRating", 11]] },
+    { id: "Id_Item_ClothPants_1001", slot: 4, properties: [["Id_ItemPropertyType_Effect_ArmorRating", 9]] },
+    { id: "Id_Item_AdventurerBoots_1001", slot: 5, properties: [["Id_ItemPropertyType_Effect_ArmorRating", 6]] },
+    { id: "Id_Item_LeatherGloves_1001", slot: 3, properties: [["Id_ItemPropertyType_Effect_ArmorRating", 4]] },
+    { id: "Id_Item_Torch_1001", slot: 8, properties: [["Id_ItemPropertyType_Effect_PhysicalWeaponDamage", 9]] },
+  ];
+  const wizard = [
+    { id: "Id_Item_WizardStaff_2001", slot: 10, properties: [["Id_ItemPropertyType_Effect_PhysicalWeaponDamage", 12]] },
+    { id: "Id_Item_TimewornRobe_2001", slot: 2, properties: [["Id_ItemPropertyType_Effect_ArmorRating", 8]] },
+    { id: "Id_Item_ClothPants_1001", slot: 4, properties: [["Id_ItemPropertyType_Effect_ArmorRating", 9]] },
+    { id: "Id_Item_AdventurerBoots_1001", slot: 5, properties: [["Id_ItemPropertyType_Effect_ArmorRating", 6]] },
+    { id: "Id_Item_LeatherGloves_1001", slot: 3, properties: [["Id_ItemPropertyType_Effect_ArmorRating", 4]] },
+    { id: "Id_Item_Torch_1001", slot: 8, properties: [["Id_ItemPropertyType_Effect_PhysicalWeaponDamage", 9]] },
+  ];
+  const items = profile.className === "Wizard" ? wizard : common;
+  return items.map((item, index) => ({
+    itemUniqueId: index + 1,
+    itemId: item.id,
+    itemCount: 1,
+    inventoryId: 3,
+    slotId: item.slot,
+    itemAmmoCount: 0,
+    itemContentsCount: 0,
+    primaryPropertyArray: (item.properties || []).map(([propertyTypeId, propertyValue]) => ({ propertyTypeId, propertyValue })),
+  }));
+}
+
+function layoutRows(profile, category) {
+  if (!profile.layout?.[category]) profile.layout = normalizeLayout(profile.layout, profile.equipped);
+  return profile.layout[category];
+}
+
+function buildEquipInfoBody(profile) {
+  if (!profile || !profile.equipped) throw new Error("missing equipped class profile for equip-info response");
+  const equips = [];
+  // The client class page expects the four perk slots at 1..4 and the two
+  // skill slots at 5..6. Spells are a separate list and are not part of 3032.
+  for (const [index, perkId] of profile.equipped.perks.slice(0, 4).entries()) {
+    equips.push({ index: index + 1, isAvailableSlot: 1, requiredLevel: 1, type: 1, equipId: perkId });
+  }
+  for (const [index, skillId] of profile.equipped.skills.slice(0, 2).entries()) {
+    equips.push({ index: 5 + index, isAvailableSlot: 1, requiredLevel: 1, type: 2, equipId: skillId });
+  }
+  return encode(P.SS2C_CLASS_EQUIP_INFO_RES, { equips });
+}
+
+function buildTrainingInfoBody(classId) {
+  if (typeof classId !== "string" || !/^Id_PlayerCharacter_[A-Za-z0-9_]+$/.test(classId)) throw new Error("invalid class ID for training-info response");
+  return encode(P.SS2C_TRAINING_INFO_RES, { info: { state: 0, characterClass: classId } });
+}
+
+function buildClassLevelInfoBody() {
+  // Keep all nine scalar fields on the wire. The client class-page widgets
+  // consume the full level payload, while the generated protobuf encoder
+  // omits zero-valued fields by default. Generate field tags from the current
+  // descriptor using nonzero placeholders, then zero only each varint value.
+  const type = P.SS2C_CLASS_LEVEL_INFO_RES;
+  const fields = ["level", "exp", "expBegin", "expLimit", "rewardPoint", "nextRewardLevel", "learningPoint", "nextLearningLevel", "fame"];
+  const encoded = Buffer.from(encode(type, Object.fromEntries(fields.map((field) => [field, 1]))));
+  let offset = 0;
+  let fieldCount = 0;
+  const readVarint = () => {
+    let value = 0;
+    let shift = 0;
+    while (offset < encoded.length) {
+      const byte = encoded[offset++];
+      value += (byte & 0x7f) * 2 ** shift;
+      if ((byte & 0x80) === 0) return value;
+      shift += 7;
+      if (shift > 35) throw new Error("invalid generated class-level protobuf varint");
+    }
+    throw new Error("truncated generated class-level protobuf varint");
+  };
+  while (offset < encoded.length) {
+    const key = readVarint();
+    const wireType = key & 7;
+    if (wireType !== 0) throw new Error(`unexpected class-level protobuf wire type ${wireType}`);
+    const valueOffset = offset;
+    const value = readVarint();
+    if (value !== 1 || offset !== valueOffset + 1) throw new Error("unexpected generated class-level scalar encoding");
+    fieldCount++;
+    if (fieldCount > 1) encoded[valueOffset] = 0;
+  }
+  if (fieldCount !== fields.length) throw new Error(`class-level protobuf fields mismatch: ${fieldCount}/${fields.length}`);
+  return encoded;
+}
+
+function gameCharacterOptions(profile) {
+  if (!profile || !profile.equipped) throw new Error("missing equipped class profile for REST response");
+  if (!profile.layout) profile.layout = normalizeLayout(profile.layout, profile.equipped);
+  return {
+    perks: profile.equipped.perks.map((perkId, index) => ({ index, perkId })),
+    skills: profile.equipped.skills.map((skillId, index) => ({ index, skillId })),
+    spells: profile.layout.spells.map(({ id, slotIndex, sequenceIndex }) => ({ slotIndex, sequenceIndex, spellId: id })),
+    musics: profile.layout.musics.map(({ id, slotIndex, sequenceIndex }) => ({ musicId: id, slotIndex, sequenceIndex })),
+    shapeShifts: profile.layout.shapeShifts.map(({ id, slotIndex, sequenceIndex }) => ({ shapeShiftId: id, slotIndex, sequenceIndex })),
+  };
+}
+
+// ---- C2S protobuf readers -------------------------------------------------
+// Field numbers come from the current client descriptor:
+// SC2S_ACCOUNT_CHARACTER_CREATE_REQ { nickName=1, characterClass=2, gender=3 }
+// SCLASS_MOVE_INFO { index=1, type=2, moveId=3, move=4 }
+// SC2S_CLASS_*_MOVE_REQ { <id>=1, dstIndex=2 }
+function readVarint(buf, state) {
+  let value = 0;
+  let shift = 0;
+  while (state.offset < buf.length) {
+    const byte = buf[state.offset++];
+    value += (byte & 0x7f) * 2 ** shift;
+    if (!(byte & 0x80)) return value;
+    shift += 7;
+    if (shift > 53) throw new Error("protobuf varint overflow");
+  }
+  throw new Error("truncated protobuf varint");
+}
+
+function readFields(buf) {
+  const fields = [];
+  const state = { offset: 0 };
+  while (state.offset < buf.length) {
+    const key = readVarint(buf, state);
+    const number = Math.floor(key / 8);
+    const wire = key & 7;
+    if (wire === 0) fields.push({ number, wire, value: readVarint(buf, state) });
+    else if (wire === 1) { const start = state.offset; state.offset += 8; fields.push({ number, wire, value: buf.subarray(start, state.offset) }); }
+    else if (wire === 2) {
+      const length = readVarint(buf, state);
+      const start = state.offset;
+      state.offset += length;
+      if (state.offset > buf.length) throw new Error("truncated protobuf field");
+      fields.push({ number, wire, value: buf.subarray(start, state.offset) });
+    } else if (wire === 5) { const start = state.offset; state.offset += 4; fields.push({ number, wire, value: buf.subarray(start, state.offset) }); }
+    else throw new Error(`unsupported protobuf wire type ${wire}`);
+  }
+  return fields;
+}
+
+function field(fields, number) {
+  return fields.find((row) => row.number === number);
+}
+
+function readString(fields, number) {
+  const row = field(fields, number);
+  if (!row || row.wire !== 2) return "";
+  return row.value.toString("utf8");
+}
+
+function readNumber(fields, number, fallback = 0) {
+  const row = field(fields, number);
+  return row && row.wire === 0 ? row.value : fallback;
+}
+
+function decodeCharacterCreate(body) {
+  const fields = readFields(body);
+  return {
+    nickname: readString(fields, 1),
+    className: normalizeClassName(readString(fields, 2)),
+    gender: readNumber(fields, 3, 0),
+  };
+}
+
+function decodeClassStringIndex(body) {
+  const fields = readFields(body);
+  return { id: readString(fields, 1), index: readNumber(fields, 2, 0) };
+}
+
+function decodeMoveInfo(buf) {
+  const fields = readFields(buf);
+  return {
+    index: readNumber(fields, 1, 0),
+    type: readNumber(fields, 2, 0),
+    moveId: readString(fields, 3),
+    move: readNumber(fields, 4, 0),
+  };
+}
+
+function decodeClassItemMove(body) {
+  const fields = readFields(body);
+  const oldField = field(fields, 1);
+  const newField = field(fields, 2);
+  return {
+    oldMove: oldField && oldField.wire === 2 ? decodeMoveInfo(oldField.value) : null,
+    newMove: newField && newField.wire === 2 ? decodeMoveInfo(newField.value) : null,
+  };
+}
+
+// ---- C2S selection mutations and S2C encoders -----------------------------
+function writeVarint(value) {
+  const bytes = [];
+  let current = Number(value) || 0;
+  while (current > 127) {
+    bytes.push((current % 128) | 0x80);
+    current = Math.floor(current / 128);
+  }
+  bytes.push(current);
+  return Buffer.from(bytes);
+}
+
+function fieldVarint(number, value) {
+  return Buffer.concat([writeVarint(number * 8), writeVarint(value)]);
+}
+
+function fieldString(number, value) {
+  const data = Buffer.from(String(value), "utf8");
+  return Buffer.concat([writeVarint(number * 8 + 2), writeVarint(data.length), data]);
+}
+
+function fieldMessage(number, body) {
+  return Buffer.concat([writeVarint(number * 8 + 2), writeVarint(body.length), body]);
+}
+
+function encodeSpell(row) {
+  return Buffer.concat([fieldVarint(1, row.slotIndex), fieldVarint(2, row.sequenceIndex), fieldString(3, row.spellId)]);
+}
+
+function encodeMusic(row) {
+  return Buffer.concat([fieldString(1, row.musicId), fieldVarint(2, row.slotIndex), fieldVarint(3, row.sequenceIndex)]);
+}
+
+function encodeShapeShift(row) {
+  return Buffer.concat([fieldString(1, row.shapeShiftId), fieldVarint(2, row.slotIndex), fieldVarint(3, row.sequenceIndex)]);
+}
+
+function encodeMoveInfo(row) {
+  return Buffer.concat([fieldVarint(1, row.index), fieldVarint(2, row.type), fieldString(3, row.moveId), fieldVarint(4, row.move)]);
+}
+
+function encodeResult(result = 1) {
+  return fieldVarint(1, result);
+}
+
+function encodeSpellListResult(spells) {
+  const parts = [fieldVarint(1, 1)];
+  for (const spell of spells) parts.push(fieldMessage(2, encodeSpell(spell)));
+  return Buffer.concat(parts);
+}
+
+function encodeMusicListResult(musics) {
+  const parts = [fieldVarint(1, 1)];
+  for (const music of musics) parts.push(fieldMessage(2, encodeMusic(music)));
+  return Buffer.concat(parts);
+}
+
+function encodeShapeShiftListResult(shapeShifts) {
+  const parts = [fieldVarint(1, 1)];
+  for (const row of shapeShifts) parts.push(fieldMessage(2, encodeShapeShift(row)));
+  return Buffer.concat(parts);
+}
+
+function encodeClassItemMoveResult(oldMove, newMove) {
+  return Buffer.concat([fieldVarint(1, 1), fieldMessage(2, encodeMoveInfo(oldMove)), fieldMessage(3, encodeMoveInfo(newMove))]);
+}
+
+function spellsForResponse(profile) {
+  return layoutRows(profile, "spells").map(({ id, slotIndex, sequenceIndex }) => ({ slotIndex, sequenceIndex, spellId: id }));
+}
+
+function musicsForResponse(profile) {
+  return layoutRows(profile, "musics").map(({ id, slotIndex, sequenceIndex }) => ({ musicId: id, slotIndex, sequenceIndex }));
+}
+
+function shapeShiftsForResponse(profile) {
+  return layoutRows(profile, "shapeShifts").map(({ id, slotIndex, sequenceIndex }) => ({ shapeShiftId: id, slotIndex, sequenceIndex }));
+}
+
+function replaceAt(array, id, index) {
+  const existing = array.indexOf(id);
+  if (existing >= 0) array.splice(existing, 1);
+  const target = Math.max(0, Math.min(index, array.length));
+  array.splice(target, 0, id);
+  return target;
+}
+
+function selectSpell(profile, spellId, slotIndex, sequenceIndex) {
+  if (!profile.options.spells.includes(spellId)) throw new Error(`unknown spell: ${spellId}`);
+  replaceAt(profile.equipped.spells, spellId, sequenceIndex);
+  const row = layoutRows(profile, "spells").find((item) => item.id === spellId);
+  if (row) { row.slotIndex = slotIndex; row.sequenceIndex = sequenceIndex; }
+  else profile.layout.spells.push({ id: spellId, slotIndex, sequenceIndex });
+  normalizeLayoutInPlace(profile, "spells");
+}
+
+function selectMusic(profile, musicId, slotIndex, sequenceIndex) {
+  if (!profile.options.musics.includes(musicId)) throw new Error(`unknown music: ${musicId}`);
+  replaceAt(profile.equipped.musics, musicId, sequenceIndex);
+  const row = layoutRows(profile, "musics").find((item) => item.id === musicId);
+  if (row) { row.slotIndex = slotIndex; row.sequenceIndex = sequenceIndex; }
+  else profile.layout.musics.push({ id: musicId, slotIndex, sequenceIndex });
+  normalizeLayoutInPlace(profile, "musics");
+}
+
+function selectShapeShift(profile, shapeShiftId, slotIndex, sequenceIndex) {
+  if (!profile.options.shapeShifts.includes(shapeShiftId)) throw new Error(`unknown shape shift: ${shapeShiftId}`);
+  replaceAt(profile.equipped.shapeShifts, shapeShiftId, sequenceIndex);
+  const row = layoutRows(profile, "shapeShifts").find((item) => item.id === shapeShiftId);
+  if (row) { row.slotIndex = slotIndex; row.sequenceIndex = sequenceIndex; }
+  else profile.layout.shapeShifts.push({ id: shapeShiftId, slotIndex, sequenceIndex });
+  normalizeLayoutInPlace(profile, "shapeShifts");
+}
+
+function normalizeLayoutInPlace(profile, category) {
+  const rows = layoutRows(profile, category);
+  rows.sort((a, b) => a.sequenceIndex - b.sequenceIndex);
+  rows.forEach((row, index) => { row.sequenceIndex = index; });
+  profile.equipped[category] = rows.map((row) => row.id);
+}
+
+function applyClassItemMove(profile, oldMove, newMove) {
+  const category = SLOT_CATEGORIES[newMove?.type] || SLOT_CATEGORIES[oldMove?.type];
+  if (!category || !newMove?.moveId) return false;
+  if (!profile.options[category].includes(newMove.moveId)) throw new Error(`unknown ${category} item: ${newMove.moveId}`);
+  const target = Math.max(0, Math.min(newMove.index, profile.options[category].length));
+  if (category === "perks" || category === "skills") {
+    const rows = profile.equipped[category];
+    if (oldMove?.moveId) {
+      const oldIndex = rows.indexOf(oldMove.moveId);
+      if (oldIndex >= 0) rows.splice(oldIndex, 1);
+    }
+    const existing = rows.indexOf(newMove.moveId);
+    if (existing >= 0) rows.splice(existing, 1);
+    rows.splice(Math.min(target, rows.length), 0, newMove.moveId);
+  } else {
+    const slot = category === "spells" ? 0 : 0;
+    if (category === "spells") selectSpell(profile, newMove.moveId, slot, newMove.index);
+    else if (category === "musics") selectMusic(profile, newMove.moveId, slot, newMove.index);
+    else selectShapeShift(profile, newMove.moveId, slot, newMove.index);
+  }
+  return true;
+}
+
+module.exports = {
+  TRAINING_CLASSES, LOBBY_CLASSES, OPTION_FIELDS, EQUIP_TYPES,
+  buildClassListBody, loadProfiles, selectedClass, trainingClass, setTrainingClass,
+  listLoadouts, getLoadout, saveLoadout, deleteLoadout,
+  buildOptionListBody, buildEquipInfoBody, buildTrainingInfoBody, buildClassLevelInfoBody,
+  gameCharacterOptions,
+  classRef, normalizeClassName, loadCharacterProfile, saveCharacterProfile,
+  deleteCharacterProfile, profileFromClass, decodeCharacterCreate, decodeClassItemMove,
+  decodeClassStringIndex, encodeResult, encodeSpellListResult, encodeMusicListResult,
+  encodeShapeShiftListResult, encodeClassItemMoveResult, encodeMoveInfo,
+  starterItems, spellsForResponse, musicsForResponse, shapeShiftsForResponse,
+  selectSpell, selectMusic, selectShapeShift, applyClassItemMove,
+};

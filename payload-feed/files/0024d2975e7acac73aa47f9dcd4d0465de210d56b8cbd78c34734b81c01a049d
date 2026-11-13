@@ -1,0 +1,18 @@
+-- Single source for filesystem paths used by the TrainingCamp Lua modules.
+local ROOT = assert(os.getenv("DARKERLAB_ROOT"), "DARKERLAB_ROOT is not set")
+local GAME = os.getenv("DARKERLAB_GAME_PATH")
+if not GAME or GAME == "" then
+  GAME = ROOT .. "/game/" .. (os.getenv("DARKERLAB_GAME_COPY") or "Dark and Darker-NoAC")
+end
+GAME = GAME:gsub("\\", "/"):gsub("/+$", "")
+local MOD = GAME .. "/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/"
+
+return {
+  root = ROOT,
+  game = GAME,
+  mod = MOD,
+  scripts = MOD .. "scripts/",
+  output = ROOT .. "/src/build/output/native/",
+  runtime = ROOT .. "/runtime/",
+  user = ROOT .. "/user/",
+}

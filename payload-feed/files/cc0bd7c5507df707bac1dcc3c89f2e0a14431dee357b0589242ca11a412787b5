@@ -1,0 +1,15 @@
+-- Pure panel visibility transitions; key registration stays in panel.lua.
+local M = {}
+
+function M.togglePanel(state)
+  state.panelVisible = not state.panelVisible
+  return state.panelVisible
+end
+
+function M.toggleFromMenuKey(state)
+  if not state.panelOnMenuKeys then return nil end
+  state.panelVisible = not state.panelVisible
+  return state.panelVisible
+end
+
+return M

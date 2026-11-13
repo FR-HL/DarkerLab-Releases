@@ -1,0 +1,159 @@
+{
+  "schema": 1,
+  "active": {
+    "gameVersion": "0.18.160.10688",
+    "sourceProfileId": "dad-0.18.160.10688-32584eee-source",
+    "finalProfileId": "dad-0.18.160.10688-89620b88"
+  },
+  "components": {
+    "gui": {
+      "version": "107",
+      "dll": "gui.dll"
+    },
+    "core": {
+      "version": "1",
+      "dll": "training_core.dll"
+    }
+  },
+  "profiles": [
+    {
+      "id": "dad-0.18.160.10688-32584eee-source",
+      "status": "supported",
+      "gameVersion": "0.18.160.10688",
+      "gameExeSha256": "32584eeeaf7e5f3ebbde49c17f9cf42f8d1b9a398af3c9234a37bc01c490c2da",
+      "gameExeBytes": 275482088,
+      "catalogBuild": "0.18.160.10688",
+      "catalogProfile": "0.18.160.10688",
+      "uiCatalogBuild": "0.18.160.10688",
+      "uiCatalogProfile": "0.18.160.10688",
+      "steamAppId": "2016590",
+      "engine": "UE5.8",
+      "compatibility": "Steam source 0.18.160.10688. Native RVA, patch chain, UE4SS signature and catalogs still need adaptation; not selectable until status is supported.",
+      "runtimeVariant": "steam-source",
+      "trainingPatch": {
+        "path": "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/DungeonCrawler.exe",
+        "fileOffset": "0x668b6b6",
+        "beforeSha256": "32584eeeaf7e5f3ebbde49c17f9cf42f8d1b9a398af3c9234a37bc01c490c2da",
+        "afterSha256": "2cd542b03557675f60a2b1653874e175a1c5922444f6bf7179c834cb345780b7",
+        "beforeBytes": "49 8b cd e8 32 91 d5 ff",
+        "afterBytes": "45 33 e4 e9 ff 00 00 00"
+      },
+      "ironShieldPatch": {
+        "path": "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/DungeonCrawler.exe",
+        "fileOffset": "0x1207790",
+        "beforeSha256": "2cd542b03557675f60a2b1653874e175a1c5922444f6bf7179c834cb345780b7",
+        "afterSha256": "89620b88f6219462fbddd1958a418ebc15745e1385498a2b41ad68673bda689b",
+        "beforeBytes": "48 83 ec",
+        "afterBytes": "33 c0 c3"
+      },
+      "verified": [
+        "2026-11-12 static: new source hash 32584eee...; training patch at 0x668b6b6 and IronShield at 0x1207790 produce intermediate 2cd542b0... and final 89620b88...; runtime not tested."
+      ],
+      "limits": [
+        "Patch offsets are static-derived from the 0.18.160.10688 source and require live startup verification.",
+        "UI class profile data is pending new USMAP/class-schema extraction; do not treat it as fully regenerated."
+      ],
+      "ue4ss": {
+        "package": "UE4SS_v3.0.1-1181-g83330635.zip",
+        "git": "83330635",
+        "staticConstructObjectSignature": "33 c0 c3 cc cc cc cc cc cc cc cc cc cc cc cc cc b8 00 00 00 20 c3 cc cc",
+        "staticConstructObjectMatchRva": "0x14c3ae0",
+        "staticConstructObjectMatchFileOffset": "0x14c30e0",
+        "staticConstructObjectUniquePatternBytes": 24,
+        "source": "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/UE4SS.dll"
+      },
+      "integrityFiles": [
+        {
+          "path": "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/dwmapi.dll",
+          "sha256": "15574afd2e14df67eb17c16ad1e7c51065afff74838b6fb340f64b1d6f61f4aa"
+        },
+        {
+          "path": "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/UE4SS.dll",
+          "sha256": "ce5e3c46a920cc00b2817ac61e438c9162830290379d0b5b9c4dfc2b29459290"
+        },
+        {
+          "path": "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/UE4SS_Signatures/StaticConstructObject.lua",
+          "sha256": "a295dce50e9351da18da1c07b3a222a5e703066e9ba21581b00cb565a6ec83bd"
+        },
+        {
+          "path": "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/Mods/mods.txt",
+          "sha256": "48598e5b53508db979ec8a07a7b3ba2b9289a6fa06afa9f24aa81cd666af5e57"
+        },
+        {
+          "path": "game/Dark and Darker-NoAC/steam_appid.txt",
+          "sha256": "495d368d1d98a08bf663599063075cfc6fc803f7861089c176db3b93e359de2b"
+        },
+        {
+          "path": "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/steam_appid.txt",
+          "sha256": "495d368d1d98a08bf663599063075cfc6fc803f7861089c176db3b93e359de2b"
+        }
+      ],
+      "native": {
+        "gameInfoGetterRva": "0x69185b0",
+        "gameInfoGetterBytes": "48 8d 81 90 01 00 00 c3",
+        "gameInfoFieldOffset": "0x700",
+        "monsterInitializeRva": "0x67cb890",
+        "monsterAiStartRva": "0x67bab40",
+        "playerClassGetterRva": "0x62a2ea0"
+      }
+    },
+    {
+      "id": "dad-0.18.160.10688-89620b88",
+      "status": "supported",
+      "gameVersion": "0.18.160.10688",
+      "gameExeSha256": "89620b88f6219462fbddd1958a418ebc15745e1385498a2b41ad68673bda689b",
+      "gameExeBytes": 275482088,
+      "catalogBuild": "0.18.160.10688",
+      "catalogProfile": "0.18.160.10688",
+      "uiCatalogBuild": "0.18.160.10688",
+      "uiCatalogProfile": "0.18.160.10688",
+      "steamAppId": "2016590",
+      "engine": "UE5.8",
+      "ue4ss": {
+        "package": "UE4SS_v3.0.1-1181-g83330635.zip",
+        "git": "83330635",
+        "staticConstructObjectSignature": "33 c0 c3 cc cc cc cc cc cc cc cc cc cc cc cc cc b8 00 00 00 20 c3 cc cc",
+        "staticConstructObjectMatchRva": "0x14c3ae0",
+        "staticConstructObjectMatchFileOffset": "0x14c30e0",
+        "staticConstructObjectUniquePatternBytes": 24,
+        "source": "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/UE4SS.dll"
+      },
+      "compatibility": "Final NoAC output for 0.18.160.10688; static patch chain recorded; native/UE4SS/catalog runtime acceptance pending.",
+      "runtimeVariant": "final-noac-output",
+      "integrityFiles": [
+        {
+          "path": "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/dwmapi.dll",
+          "sha256": "15574afd2e14df67eb17c16ad1e7c51065afff74838b6fb340f64b1d6f61f4aa"
+        },
+        {
+          "path": "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/UE4SS.dll",
+          "sha256": "ce5e3c46a920cc00b2817ac61e438c9162830290379d0b5b9c4dfc2b29459290"
+        },
+        {
+          "path": "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/UE4SS_Signatures/StaticConstructObject.lua",
+          "sha256": "a295dce50e9351da18da1c07b3a222a5e703066e9ba21581b00cb565a6ec83bd"
+        },
+        {
+          "path": "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/ue4ss/Mods/mods.txt",
+          "sha256": "48598e5b53508db979ec8a07a7b3ba2b9289a6fa06afa9f24aa81cd666af5e57"
+        },
+        {
+          "path": "game/Dark and Darker-NoAC/steam_appid.txt",
+          "sha256": "495d368d1d98a08bf663599063075cfc6fc803f7861089c176db3b93e359de2b"
+        },
+        {
+          "path": "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/steam_appid.txt",
+          "sha256": "495d368d1d98a08bf663599063075cfc6fc803f7861089c176db3b93e359de2b"
+        }
+      ],
+      "native": {
+        "gameInfoGetterRva": "0x69185b0",
+        "gameInfoGetterBytes": "48 8d 81 90 01 00 00 c3",
+        "gameInfoFieldOffset": "0x700",
+        "monsterInitializeRva": "0x67cb890",
+        "monsterAiStartRva": "0x67bab40",
+        "playerClassGetterRva": "0x62a2ea0"
+      }
+    }
+  ]
+}

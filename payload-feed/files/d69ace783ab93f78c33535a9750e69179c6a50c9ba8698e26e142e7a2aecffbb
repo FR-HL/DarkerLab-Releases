@@ -1,0 +1,410 @@
+-- Domain module. Generated from the old single-purpose Lua modules.
+local ROOT=assert(os.getenv('DARKERLAB_ROOT'),'DARKERLAB_ROOT is not set')
+local MOD=_G.__DARKERLAB_MOD_DIR or (ROOT..'/game/'..(os.getenv('DARKERLAB_GAME_COPY') or 'Dark and Darker-NoAC')..'/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/scripts/')
+local function loadDomain(name)
+ local cache=_G.__DARKERLAB_DOMAIN_CACHE or {};_G.__DARKERLAB_DOMAIN_CACHE=cache
+ if not cache[name] then cache[name]=dofile(MOD..name..'.lua') end
+ return cache[name]
+end
+local Core=loadDomain('core')
+local function make_Surface()
+local ROOT=assert(os.getenv('DARKERLAB_ROOT'),'DARKERLAB_ROOT is not set')
+-- Original floor/navigation queries shared by root placement and dependencies.
+local T=Core.types
+local S={}
+function S.forMonster(m)
+ assert(T.valid(m)and T.valid(m.CharacterMovement)and T.valid(m.CapsuleComponent),'Original movement/capsule unavailable')
+ local radius=m.CapsuleComponent:GetScaledCapsuleRadius();local half=m.CapsuleComponent:GetScaledCapsuleHalfHeight()
+ local project=StaticFindObject('/Script/NavigationSystem.NavigationSystemV1:K2_ProjectPointToNavigation')
+ local lib=StaticFindObject('/Script/NavigationSystem.Default__NavigationSystemV1')
+ return{radius=radius,halfHeight=half,
+  floor=function(p)
+   local floor={};m.CharacterMovement:K2_ComputeFloorDist({X=p.X,Y=p.Y,Z=p.Z+math.max(300,half+50)},1800,1800,radius,floor)
+   local hit=floor.HitResult
+   if floor.bWalkableFloor and floor.bBlockingHit and hit and hit.bBlockingHit and(not hit.bStartPenetrating or(tonumber(hit.PenetrationDepth)or math.huge)<=0.1)then local p=hit.ImpactPoint;return{X=p.X,Y=p.Y,Z=p.Z}end
+  end,
+  project=function(p)local out={};if project(lib,m,{X=p.X,Y=p.Y,Z=p.Z+20},out,nil,nil,{X=100,Y=100,Z=200})then return out end end}
+end
+function S.ready(m)
+ local env=S.forMonster(m);local at=m:K2_GetActorLocation();local floor=env.floor(at)
+ if not floor then return false,'original_actor_floor_pending'end
+ local nav=env.project(floor)
+ if not nav or math.abs(nav.X-floor.X)>120 or math.abs(nav.Y-floor.Y)>120 or math.abs(nav.Z-floor.Z)>200 then return false,'original_actor_navigation_pending'end
+ return true,'original_actor_surface_ready'
+end
+return S
+
+end
+local Surface=make_Surface()
+local SurfaceDomain=Surface
+local function make_Navigation()
+local ROOT=assert(os.getenv('DARKERLAB_ROOT'),'DARKERLAB_ROOT is not set')
+-- Move the existing original dynamic-nav bounds to the active streamed scene.
+-- Original Recast builds navigation; no custom pathfinding or AI overrides.
+local T=Core.types
+local Surface=SurfaceDomain
+local N={}
+local shared=_G.__DARKERLAB_SHARED_NAVIGATION or{};_G.__DARKERLAB_SHARED_NAVIGATION=shared
+function N.request(actor,stage)
+ local volumes=FindAllOf('NavMeshBoundsVolume')or{};local systems=FindAllOf('NavigationSystemV1')or{}
+ assert(#volumes>0 and #systems>0,'Original navigation bounds/system unavailable')
+ local world=assert(T.world(actor),'Active offline world unavailable')
+ local function sameWorld(o)
+  if not T.valid(o)then return false end
+  local ok,w=pcall(T.world,o);if ok and T.valid(w)and w:GetAddress()==world:GetAddress()then return true end
+  local current=o
+  for _=1,8 do local yes,parent=pcall(function()return current:GetOuter()end);if not yes or not T.valid(parent)then break end;if parent:GetAddress()==world:GetAddress()then return true end;current=parent end
+  return false
+ end
+ local function currentOf(all)for _,o in ipairs(all)do if sameWorld(o)then return o end end end
+ local volume=assert(currentOf(volumes),'Navigation bounds for the current world unavailable');local system=assert(currentOf(systems),'Navigation system for the current world unavailable')
+ local component=volume.RootComponent;assert(T.valid(component),'Original navigation volume root missing')
+ assert(T.valid(T.world(volume))and T.world(volume):GetAddress()==T.world(actor):GetAddress(),'Navigation volume belongs to another world')
+ local recast=assert(currentOf(FindAllOf('RecastNavMesh')or{}),'Current-world Recast navigation unavailable')
+ assert(recast.RuntimeGeneration==2,'Original Recast is not configured for dynamic generation')
+ local origin,extent={},{};volume:GetActorBounds(false,origin,extent,false)
+ local function vector(v)return{X=v.X,Y=v.Y,Z=v.Z}end
+ local oldPosition=vector(volume:K2_GetActorLocation());local oldScale=vector(volume:GetActorScale3D())
+ local oldMobility=component.Mobility
+ local at=vector(stage.mode=='current'and stage.anchorPoint or actor:K2_GetActorLocation())
+ if not shared.original then shared.original={position=oldPosition,scale=oldScale}end
+ local scale={X=oldScale.X*math.max(1,10000/math.max(extent.X,1)),Y=oldScale.Y*math.max(1,10000/math.max(extent.Y,1)),Z=oldScale.Z*math.max(1,5000/math.max(extent.Z,1))}
+ local r={actor=actor,anchor=stage.mode=='current'and stage.anchorPoint or nil,volume=volume,system=system,component=component,oldMobility=oldMobility,at=at,started=os.time(),stage=stage,oldPosition=oldPosition,oldScale=oldScale}
+ local ok,e=pcall(function()
+  component:SetMobility(2)
+  assert(volume:K2_SetActorLocation({X=at.X,Y=at.Y,Z=at.Z},false,{},true),'Navigation bounds movement rejected')
+  volume:SetActorScale3D(scale)
+  local moved=volume:K2_GetActorLocation()
+  assert(math.abs(moved.X-at.X)<1 and math.abs(moved.Y-at.Y)<1,'Navigation bounds did not move to the selected scene')
+  system:OnNavigationBoundsUpdated(volume)
+ end)
+ if not ok then pcall(N.restore,r);error(e)end
+ shared.active=r;return r
+end
+function N.poll(r)
+ assert(T.valid(r.actor),'Navigation source actor invalid')
+ local surface=Surface.forMonster(r.actor)
+ local raw=r.anchor or r.actor:K2_GetActorLocation();local at={X=raw.X,Y=raw.Y,Z=raw.Z};local rot=r.actor:K2_GetActorRotation();local yaw=rot.Yaw or rot.Y or 0
+ local currentArea=r.stage and r.stage.mode=='current'
+ local sampleRadius=currentArea and 300 or surface.radius
+ local points={{X=at.X,Y=at.Y,Z=at.Z}}
+ for i=1,6 do local a=math.rad(yaw+180+i*60);points[#points+1]={X=at.X+sampleRadius*math.cos(a),Y=at.Y+sampleRadius*math.sin(a),Z=at.Z}end
+ local tested,good=0,0
+ local centerReady,nearbyReady=false,false
+ for index,p in ipairs(points)do
+  local hit=surface.floor(p)
+  if hit then
+   tested=tested+1;local projected=surface.project(hit)
+   if projected and math.abs(projected.X-hit.X)<=120 and math.abs(projected.Y-hit.Y)<=120 and math.abs(projected.Z-hit.Z)<=200 then good=good+1;if index==1 then centerReady=true else nearbyReady=true end end
+  end
+ end
+ r.tested=tested;r.good=good;r.centerReady=centerReady;r.ready=currentArea and nearbyReady or(not currentArea and centerReady)
+ r.reason='Navigation '..good..'/7 projected; '..tested..'/7 walkable; center='..tostring(centerReady)..'; sample_radius='..sampleRadius
+ return r.ready
+end
+function N.restore(r)
+ if T.valid(r.volume)then
+  r.component:SetMobility(2);assert(r.volume:K2_SetActorLocation(r.oldPosition,false,{},true),'Navigation bounds restore failed')
+  r.volume:SetActorScale3D(r.oldScale);r.component:SetMobility(r.oldMobility);r.system:OnNavigationBoundsUpdated(r.volume)
+ end
+ if shared.active==r then shared.active=nil end
+end
+return N
+
+end
+local Navigation=make_Navigation()
+local NavigationDomain=Navigation
+local function make_Stages()
+local ROOT=assert(os.getenv('DARKERLAB_ROOT'),'DARKERLAB_ROOT is not set')
+-- Generic lazy loading/reuse of authored DungeonModule A/S/D layers.
+local T=Core.types
+local Catalog=Core.catalog
+local Navigation=NavigationDomain
+local Surface=SurfaceDomain
+local state=_G.__DARKERLAB_COMMON_STAGES or{cache={},serial=0};_G.__DARKERLAB_COMMON_STAGES=state
+local St={}
+local function sourceLevel(o)return o:GetOuter():GetFullName()end
+local function assetPath(o)
+ local a=o.SpawnerDataAsset;if not T.valid(a)then return nil end
+ return a:GetFullName():match(' (/Game/[^ ]+)')
+end
+local function inWorld(o)
+ local pc=require('UEHelpers').GetPlayerController()
+ local ok,v=pcall(function()return T.world(o):GetAddress()==T.world(pc):GetAddress()end)
+ return ok and v
+end
+local function isSpawner(o)
+ local ok,name=pcall(function()return o:GetClass():GetFName():ToString()end)
+ return ok and name=='BP_GameSpawner_C'
+end
+function St.sourceMatches(o,r)
+ local path=assetPath(o);if not path then return false end
+ for _,s in ipairs(r.spawners)do local expected=s.path..'.'..s.path:match('([^/]+)$');if path==expected then return true end end
+ return false
+end
+function St.findAnySpawner(stage)
+ local a={}
+ for _,o in ipairs(FindAllOf('BP_GameSpawner_C')or{})do
+  if T.valid(o)and isSpawner(o)and inWorld(o)and(not stage.token or sourceLevel(o):find(stage.token,1,true))then a[#a+1]=o end
+ end
+ table.sort(a,function(x,y)return x:GetFullName()<y:GetFullName()end)
+ return a[1]
+end
+function St.findSpawner(r,stage)
+ local a={}
+ for _,o in ipairs(FindAllOf('BP_GameSpawner_C')or{})do
+  if T.valid(o)and isSpawner(o)and inWorld(o)and St.sourceMatches(o,r)and(not stage.token or sourceLevel(o):find(stage.token,1,true))then a[#a+1]=o end
+ end
+ table.sort(a,function(x,y)return x:GetFullName()<y:GetFullName()end)
+ return a[1]
+end
+local function isReleasedModule(module)
+  if not module or not module.levels then return false end
+  local hasReleasedPath=false
+  for _,path in pairs(module.levels)do
+   if path:find('/Maps/Dungeon/Modules/',1,true)then hasReleasedPath=true end
+   if path:find('/Maps_Draft/',1,true)or path:find('/Retired/',1,true)then return false end
+  end
+  return hasReleasedPath
+end
+local function moduleHasMonster(module,monsterId)
+  for _,relation in ipairs(module.spawner_relations or{})do
+   for _,id in ipairs(relation.monster_ids or{})do if id==monsterId then return true end end
+  end
+  return false
+end
+function St.originalModule(r,moduleId)
+ local module=moduleId and Catalog.modules[moduleId]or nil
+ if moduleId then assert(isReleasedModule(module),'Selected module is not a released dungeon module');assert(moduleHasMonster(module,r.id),'Selected original module has no authored spawner relation for this monster')
+ else
+  local candidates={}
+  for _,id in ipairs(r.modules or{})do
+   local candidate=Catalog.modules[id]
+   if isReleasedModule(candidate)and moduleHasMonster(candidate,r.id)then candidates[#candidates+1]=candidate end
+  end
+  table.sort(candidates,function(a,b)return a.id<b.id end)
+  module=candidates[1]
+ end
+ assert(module,'No released original dungeon module with an authored spawner was found for this monster')
+ return module
+end
+function St.request(r,moduleId,mode)
+ mode=mode or'current'
+ assert(mode=='current'or mode=='original','Unknown scene mode')
+ if mode=='current'then
+  local pc=require('UEHelpers').GetPlayerController();assert(T.valid(pc)and T.valid(pc.Pawn),'No dungeon player')
+  local world=T.identity(T.world(pc));local occupied=state.occupiedWorld==world and state.occupiedScene or nil
+  if occupied and state.cache[occupied]then state.cache[occupied].used=os.time()end
+  return{ready=true,id='current-world',hostingScene=occupied,mode=mode,levels={},world=world,started=os.time()}
+ end
+ local module=St.originalModule(r,moduleId)
+ local pc=require('UEHelpers').GetPlayerController();local world=T.identity(T.world(pc))
+ local cached=state.cache[module.id]
+ if cached and cached.world==world then cached.used=os.time();return cached end
+ if cached then state.cache[module.id]=nil end
+ -- Reuse an already present authored module, including preexisting instances.
+ local token=module.levels.SubLevelAssetD and module.levels.SubLevelAssetD:match('([^/]+)$')
+ local stage={id=module.id,mode=mode,token=token,levels={},started=os.time(),used=os.time(),module=module,world=world}
+ if St.findSpawner(r,stage)then stage.ready=true;stage.reused=true;state.cache[module.id]=stage;return stage end
+ state.serial=state.serial+1
+ local location={X=100000+(state.serial%8)*50000,Y=math.floor(state.serial/8)*50000,Z=0}
+ stage.offset=location;stage.token='DLStage'..state.serial
+ local lib=StaticFindObject('/Script/Engine.Default__LevelStreamingDynamic')
+ local fn=StaticFindObject('/Script/Engine.LevelStreamingDynamic:LoadLevelInstance')
+ for _,field in ipairs({'SubLevelAssetA','SubLevelAssetS','SubLevelAssetD'})do
+  local path=module.levels[field]
+  if path then local success={};local o=fn(lib,pc,path,location,{Pitch=0,Yaw=0,Roll=0},success,stage.token..'_'..field,nil,false)
+   assert(T.valid(o),'Original scene layer rejected: '..path);stage.levels[#stage.levels+1]=o
+  end
+ end
+ assert(#stage.levels>0,'Original module has no usable layers')
+ state.cache[module.id]=stage;return stage
+end
+function St.requestRoom(moduleId)
+ local module=Catalog.modules[moduleId]
+ assert(module,'Unknown boss room module: '..tostring(moduleId))
+ local pc=require('UEHelpers').GetPlayerController();assert(T.valid(pc)and T.valid(pc.Pawn),'No dungeon player')
+ local world=T.identity(T.world(pc));local cached=state.cache[module.id]
+ if cached and cached.world==world then cached.mode='room';cached.used=os.time();return cached end
+ if cached then state.cache[module.id]=nil end
+ local token=module.levels.SubLevelAssetD and module.levels.SubLevelAssetD:match('([^/]+)$')
+ local stage={id=module.id,mode='room',token=token,levels={},started=os.time(),used=os.time(),module=module,world=world}
+ state.serial=state.serial+1
+ local location={X=100000+(state.serial%8)*50000,Y=math.floor(state.serial/8)*50000,Z=0}
+ stage.offset=location;stage.token='DLStage'..state.serial
+ local lib=StaticFindObject('/Script/Engine.Default__LevelStreamingDynamic')
+ local fn=StaticFindObject('/Script/Engine.LevelStreamingDynamic:LoadLevelInstance')
+ for _,field in ipairs({'SubLevelAssetA','SubLevelAssetS','SubLevelAssetD'})do
+  local path=module.levels[field]
+  if path then local success={};local o=fn(lib,pc,path,location,{Pitch=0,Yaw=0,Roll=0},success,stage.token..'_'..field,nil,false)
+   assert(T.valid(o),'Original scene layer rejected: '..path);stage.levels[#stage.levels+1]=o
+  end
+ end
+ assert(#stage.levels>0,'Original module has no usable layers')
+ state.cache[module.id]=stage;return stage
+end
+function St.bossSpawner(s)
+ if not s or not s.module then return nil end
+ for _,r in pairs(Catalog.records)do
+  local kind=tostring(r.class_type or'')
+  if kind:find('Class.Boss',1,true)and not kind:find('SubBoss',1,true)then
+   local belongs=false
+   for _,id in ipairs(r.modules or{})do if id==s.module.id then belongs=true;break end end
+   if belongs then
+    for _,source in ipairs(r.spawners or{})do
+     local expected=source.path..'.'..source.path:match('([^/]+)$')
+     for _,o in ipairs(FindAllOf('BP_GameSpawner_C')or{})do
+      if T.valid(o)and isSpawner(o)and inWorld(o)and(not s.token or sourceLevel(o):find(s.token,1,true))and assetPath(o)==expected then return o end
+     end
+    end
+   end
+  end
+ end
+end
+function St.roomPoint(s)
+ local pc=require('UEHelpers').GetPlayerController();local player=pc.Pawn
+ local half=player.CapsuleComponent:GetScaledCapsuleHalfHeight()
+ local anchor=St.bossSpawner(s)
+ if T.valid(anchor)then
+  local q=anchor:K2_GetActorLocation();local point={X=q.X,Y=q.Y,Z=q.Z+half+5}
+  local ok,env=pcall(function()return Surface.forMonster(player)end)
+  if ok then local ground=env.floor({X=q.X,Y=q.Y,Z=q.Z+100});if ground then point={X=ground.X,Y=ground.Y,Z=ground.Z+half+5}end end
+  return point
+ end
+ local candidates={}
+ for _,o in ipairs(FindAllOf('PlayerStart')or{})do
+  if T.valid(o)and inWorld(o)and s and s.token and sourceLevel(o):find(s.token,1,true)then candidates[#candidates+1]=o end
+ end
+ table.sort(candidates,function(a,b)return T.identity(a)<T.identity(b)end)
+ if candidates[1]then local q=candidates[1]:K2_GetActorLocation();return{X=q.X,Y=q.Y,Z=q.Z}end
+ return nil
+end
+function St.poll(s)
+ if s.mode=='current'then s.ready=true;return true end
+ if s.ready then return true end
+ for _,o in ipairs(s.levels)do if not T.valid(o)or not o:IsLevelLoaded()or not o:IsLevelVisible()then return false end end
+ s.ready=true;return true
+end
+function St.findExisting(r,stage,exclude)
+ for _,o in ipairs(FindAllOf('DCMonsterBase')or{})do
+  if T.valid(o)and(not T.valid(exclude)or o:GetAddress()~=exclude:GetAddress())and inWorld(o)and o:GetClass():GetFName():ToString()==r.class and(not stage.token or sourceLevel(o):find(stage.token,1,true))then
+   local life=_G.__DARKERLAB_COMMON_LIFECYCLE
+   local prior=life and life.core.records[T.identity(o)]
+   if(not prior or prior.phase~='removed')and(not o.AbilitySystemComponent.bGASInitilized or(T.health(o)or 0)>0)then return o end
+  end
+ end
+end
+function St.spawn(r,s,exclude)
+ assert(s.ready,'Scene still loading')
+ if s.mode~='current'then local original=St.findExisting(r,s,exclude);if original then return original,'original_scene_spawn'end end
+ local sp
+ if s.mode=='current'then
+  local player=require('UEHelpers').GetPlayerController().Pawn;local at=player:K2_GetActorLocation();local best=math.huge
+  for _,candidate in ipairs(FindAllOf('BP_GameSpawner_C')or{})do
+   if T.valid(candidate)and inWorld(candidate)then local p=candidate:K2_GetActorLocation();local distance=(p.X-at.X)^2+(p.Y-at.Y)^2+(p.Z-at.Z)^2
+    if distance<best then sp=candidate;best=distance end
+   end
+  end
+ elseif s.mode=='room'then sp=St.findAnySpawner(s)
+ else sp=St.findSpawner(r,s)end
+ assert(T.valid(sp),'No original spawner in the selected offline world')
+ local fn=StaticFindObject('/Script/DungeonCrawler.DCGameSpawner:SpawnMonster')
+ local source=assert(r.spawners[1],'No original spawner data relation')
+ local data=LoadAsset(source.path..'.'..source.path:match('([^/]+)$'))
+ assert(T.valid(data),'Original spawner asset unavailable')
+ local system=StaticFindObject('/Script/Engine.Default__KismetSystemLibrary')
+ local identify=StaticFindObject('/Script/Engine.KismetSystemLibrary:GetPrimaryAssetIdFromSoftObjectReference')
+ local selected=nil
+ for i=1,#data.SpawnerItemArray do local row=data.SpawnerItemArray[i];local id=identify(system,row.MonsterId)
+  if id.PrimaryAssetName:ToString()==r.id then selected=row;break end
+ end
+ assert(selected,'Original spawner no longer contains selected data ID; rebuild catalog')
+ local m=fn(sp,selected.MonsterId,selected.LootDropGroupId,nil,false)
+ assert(T.isA(m,'DCMonsterBase'),'Original SpawnMonster returned no monster')
+ assert(m:GetClass():GetFName():ToString()==r.class,'Original selected record class mismatch')
+ return m,'original_spawnmonster'
+end
+function St.placeCurrent(m,s)
+ assert(s.mode=='current'or s.mode=='room','Scene placement required')
+ local pc=require('UEHelpers').GetPlayerController();local player=pc.Pawn
+ assert(T.identity(T.world(pc))==s.world,'World changed during selection')
+ local at=player:K2_GetActorLocation();local f=player:GetActorForwardVector()
+ local radius=m.CapsuleComponent:GetScaledCapsuleRadius();local half=m.CapsuleComponent:GetScaledCapsuleHalfHeight()
+ local distance=math.max(300,radius+player.CapsuleComponent:GetScaledCapsuleRadius()+80)
+ local point={X=at.X+f.X*distance,Y=at.Y+f.Y*distance,Z=at.Z-player.CapsuleComponent:GetScaledCapsuleHalfHeight()+half+5}
+ -- One optional original floor measurement aligns height; it never rejects or picks another point.
+ local ok,ground=pcall(function()return Surface.forMonster(m).floor(point)end)
+ if ok and ground then point.Z=ground.Z+half+5 end
+ assert(m:K2_SetActorLocation(point,false,{},true),'Original actor placement failed')
+ return point
+end
+function St.prepare(m,s,request)
+ assert(T.valid(m),'Original monster invalidated before initialization')
+ if not request.navigationAttempted then
+  request.navigationAttempted=true;request.navigationAt=os.time()
+  local ok,result=pcall(Navigation.request,m,s)
+  if ok then request.navigation=result else request.navigationDiagnostic=tostring(result);print('[TRAINING-NAV] '..request.navigationDiagnostic)end
+  return false,'Preparing original runtime'
+ end
+ -- Prepare native navigation asynchronously; no floor/ring suitability gate.
+ local ok,busy=pcall(function()
+  local fn=StaticFindObject('/Script/NavigationSystem.NavigationSystemV1:IsNavigationBeingBuilt')
+  if not T.valid(fn)then return false end
+  return fn(StaticFindObject('/Script/NavigationSystem.Default__NavigationSystemV1'),m)
+ end)
+ if ok and busy and os.time()-request.navigationAt<3 then return false,'Preparing original runtime' end
+ return true
+end
+function St.positionContext(s)
+ local host=(s.mode=='original' or s.mode=='room')and s or(s.hostingScene and state.cache[s.hostingScene])
+ return s.world..'|'..(host and(host.id..'|'..tostring(host.token))or'world-entry')
+end
+function St.cancelPreparation(request)
+ if request.navigation then Navigation.restore(request.navigation);request.navigation=nil end
+end
+function St.playerPoint(m,s)
+ local player=require('UEHelpers').GetPlayerController().Pawn
+ local candidates={}
+ for _,o in ipairs(FindAllOf('PlayerStart')or{})do
+  if T.valid(o)and inWorld(o)and s and s.token and sourceLevel(o):find(s.token,1,true)then candidates[#candidates+1]=o end
+ end
+ table.sort(candidates,function(a,b)return T.identity(a)<T.identity(b)end)
+ if candidates[1]then local q=candidates[1]:K2_GetActorLocation();return{X=q.X,Y=q.Y,Z=q.Z}end
+ local q=m:K2_GetActorLocation();local distance=math.max(300,m.CapsuleComponent:GetScaledCapsuleRadius()+player.CapsuleComponent:GetScaledCapsuleRadius()+80)
+ local point={X=q.X+distance,Y=q.Y,Z=q.Z-m.CapsuleComponent:GetScaledCapsuleHalfHeight()+player.CapsuleComponent:GetScaledCapsuleHalfHeight()+5}
+ local ok,ground=pcall(function()return Surface.forMonster(player).floor(point)end)
+ if ok and ground then point.Z=ground.Z+player.CapsuleComponent:GetScaledCapsuleHalfHeight()+5 end
+ return point
+end
+function St.activate(s)
+ if s.mode=='original'or s.mode=='room'then state.occupiedScene=s.id;state.occupiedWorld=s.world
+ elseif state.occupiedWorld~=s.world then state.occupiedScene=nil;state.occupiedWorld=s.world end
+ local occupied=state.occupiedScene and state.cache[state.occupiedScene]
+ if occupied then occupied.used=os.time()end
+end
+function St.trim(active,maximum)
+ local pc=require('UEHelpers').GetPlayerController();local world=T.identity(T.world(pc))
+ if active=='current-world'and(state.occupiedWorld~=world or not state.occupiedScene)then return end
+ local protected={};if state.occupiedWorld==world and state.occupiedScene then protected[state.occupiedScene]=true end
+ local board=_G.__DARKERLAB_SWITCHBOARD
+ for id,s in pairs(state.cache)do
+  if s.world==world and s.token then
+   for _,corpse in ipairs(board and board.retainedCorpses or{})do if T.valid(corpse)and sourceLevel(corpse):find(s.token,1,true)then protected[id]=true;break end end
+  end
+ end
+ local a={};for id,s in pairs(state.cache)do a[#a+1]={id=id,stage=s}end
+ table.sort(a,function(x,y)return(x.stage.used or 0)<(y.stage.used or 0)end)
+ local count=#a
+ for _,row in ipairs(a)do
+  if count<=maximum then break end
+  if row.id~=active and not protected[row.id]and #row.stage.levels>0 then
+   for _,o in ipairs(row.stage.levels)do if T.valid(o)then o:SetShouldBeVisible(false);o:SetShouldBeLoaded(false);o:SetIsRequestingUnloadAndRemoval(true)end end
+   state.cache[row.id]=nil;count=count-1
+  end
+ end
+end
+return St
+
+end
+local Stages=make_Stages()
+return {surface=Surface, navigation=Navigation, stages=Stages}

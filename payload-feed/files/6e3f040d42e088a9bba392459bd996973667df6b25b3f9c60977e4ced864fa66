@@ -1,0 +1,250 @@
+-- 原版技能槽写入/还原。
+-- 静态 usmap + 运行时读取得到的结构：
+--   SkillComponent.CurSkillDataList 恒为 2 项，位置即 ESkillIndex（1=>0=SKILL_INDEX_ONE，2=>1=TWO）；
+--   每项 SkillDataInfo{EffectHandle,SkillTag,CooldownTag,RemainDuration,MaxDuration,StartTime}。
+--   槽位标签取 DCSkillDataAsset.SkillTag（如 Ability.Player.Skill.Route.PommelStrike），
+--   不是 GA 自身的 AbilityTags（PommelStrike 的 AbilityTags 是 Type.Ability.ComboSkill/
+--   Type.Ability.Act.Attack）；GA 用 AbilityTriggers(TriggerTag=SkillTag, GameplayEvent) 接这场事件。
+--   每个占用槽位另有一个运行时 SkillActor：SkillData{SkillId,SkillTag,SkillCooldownTag,Count,
+--   RequiredChargeAmount,ChargeAmount,SlotIndex}+ArtDataSkill；GA_PlayerSkillBase.CurrentSkillActor
+--   与技能栏都读它。只改 CurSkillDataList 会让槽位指向"没有技能演员/没有可激活上下文"的技能，
+--   按键事件发出去却收不回来，表现为按键失效；因此两个结构必须同槽同步。
+-- 本模块不直接访问 UE4SS 全局：调用方通过 env 注入
+--   env.valid(o) / env.fname(text) / env.findAsset(assetId) / env.makeId(kind,id) /
+--   env.art(asset) / env.component(pawn) / env.log(text)
+-- 仍为 UNKNOWN（静态无法证明、未在游戏内实测）：
+--   1) CurSkillDataList[slot].EffectHandle 指向旧技能的冷却 GE；换槽时不清它，
+--      旧冷却会自然到期（不主动 RemoveActiveGameplayEffect）。
+--   2) 带充能/叠层的技能（DCSkillDataAsset.MaxCount>1）Count/ChargeAmount 统一写 1/0。
+--   3) 刷新走原版 RepNotify（OnRep_SkillData/OnRep_SkillActorList/OnRep_SkillDataList），
+--      是否有 HUD 需要额外的原生调用未验证；失败时返回值里 refreshed 为空，调用方显示 UNKNOWN。
+local M={}
+
+local function tagText(value)
+  if value==nil then return '' end
+  local ok,name=pcall(function() return value.TagName:ToString() end)
+  if ok and type(name)=='string' then return name end
+  ok,name=pcall(function() return value.TagName end)
+  if ok and type(name)=='string' then return name end
+  return ''
+end
+M.tagText=tagText
+
+local function fieldText(owner,field)
+  local ok,value=pcall(function() return owner[field] end)
+  if not ok then return '' end
+  return tagText(value)
+end
+M.fieldText=fieldText
+
+-- 三种写法逐级降级，每一步都用读回值校验，避免"写了但游戏没收到"的假成功。
+local function writeTagText(env,owner,field,text)
+  if text==nil or text=='' then return false,'空标签' end
+  local ok=pcall(function() owner[field].TagName=env.fname(text) end)
+  if ok and fieldText(owner,field)==text then return true end
+  ok=pcall(function() owner[field]={TagName=env.fname(text)} end)
+  if ok and fieldText(owner,field)==text then return true end
+  return false,'标签写入未生效'
+end
+M.writeTagText=writeTagText
+
+local function writeTag(env,owner,field,source)
+  local text=tagText(source)
+  local ok,reason=writeTagText(env,owner,field,text)
+  if ok then return true end
+  -- 同类型结构体整体复制是最后一种写法。
+  pcall(function() owner[field]=source end)
+  if fieldText(owner,field)==text then return true end
+  return false,reason
+end
+M.writeTag=writeTag
+
+local function listOf(sc)
+  local ok,list=pcall(function() return sc.CurSkillDataList end)
+  if ok and (type(list)=='table' or type(list)=='userdata') then return list end
+end
+M.listOf=listOf
+
+local function actorsOf(sc)
+  local ok,list=pcall(function() return sc.SkillActors end)
+  if ok and (type(list)=='table' or type(list)=='userdata') then return list end
+end
+M.actorsOf=actorsOf
+
+-- 槽位技能演员按"当前槽位标签"优先匹配，其次按 SkillData.SlotIndex（0 基或 1 基），最后按数组位置。
+local function actorFor(env,sc,slot,currentTag)
+  local list=actorsOf(sc)
+  if not list then return nil end
+  local byTag,byEnum,byIndex,byPosition
+  for i=1,#list do
+    local a=list[i]
+    if env.valid(a)then
+      local data
+      local okData=pcall(function() data=a.SkillData end)
+      if okData and data~=nil then
+        if currentTag~=''and fieldText(data,'SkillTag')==currentTag then byTag=a end
+        local okIdx,index=pcall(function() return tonumber(data.SlotIndex) end)
+        if okIdx then
+          if index==slot-1 then byEnum=a elseif index==slot then byIndex=a end
+        end
+      end
+      if i==slot then byPosition=a end
+    end
+  end
+  return byTag or byEnum or byIndex or byPosition
+end
+M.actorFor=actorFor
+
+-- 校验授予的 GA 是否真的由该技能标签触发（PommelStrike 这类技能不是按 AbilityTags 激活的）。
+local function triggerState(env,cdo,skillTag)
+  local ok,triggers=pcall(function() return cdo.AbilityTriggers end)
+  if not ok or type(triggers)~='table' then return 'unknown' end
+  if #triggers==0 then return 'unknown' end
+  for i=1,#triggers do
+    if tagText(triggers[i].TriggerTag)==skillTag then return 'match' end
+  end
+  return 'mismatch'
+end
+M.triggerState=triggerState
+
+function M.snapshot(env,entry,actor)
+  local snap={tag=fieldText(entry,'SkillTag'),cooldown=fieldText(entry,'CooldownTag')}
+  pcall(function() snap.remain=entry.RemainDuration;snap.max=entry.MaxDuration;snap.start=entry.StartTime end)
+  if env.valid(actor)then
+    snap.actor=actor
+    local data={}
+    pcall(function() data.tag=fieldText(actor.SkillData,'SkillTag');data.cooldown=fieldText(actor.SkillData,'SkillCooldownTag') end)
+    pcall(function()
+      data.idType=actor.SkillData.SkillId.PrimaryAssetType.Name:ToString()
+      data.idName=actor.SkillData.SkillId.PrimaryAssetName:ToString()
+    end)
+    pcall(function()
+      data.slotIndex=tonumber(actor.SkillData.SlotIndex);data.count=tonumber(actor.SkillData.Count)
+      data.charge=tonumber(actor.SkillData.ChargeAmount);data.required=tonumber(actor.SkillData.RequiredChargeAmount)
+    end)
+    pcall(function() data.art=actor.ArtDataSkill end)
+    snap.actorData=data
+  end
+  return snap
+end
+
+-- 原版 RepNotify 的入参是旧值；这里用空数组表示"上一份为空"，让原版逻辑重建一次显示/冷却。
+function M.refresh(env,sc,actor)
+  local done={}
+  if env.valid(actor)then
+    local ok=pcall(function() actor:OnRep_SkillData(actor.SkillData) end)
+    if ok then done[#done+1]='SkillActor' end
+  end
+  local okActors=pcall(function() sc:OnRep_SkillActorList({}) end)
+  if okActors then done[#done+1]='SkillActors' end
+  local okList=pcall(function() sc:OnRep_SkillDataList({}) end)
+  if okList then done[#done+1]='CurSkillDataList' end
+  return done
+end
+
+-- 把技能写进第 slot 个原版技能槽；任何前置校验失败都不写，保持原槽位。
+-- 返回结果表或 (nil, 中文原因)。
+function M.install(env,p,slot,assetId,context)
+  assert(type(env)=='table'and type(env.valid)=='function'and type(env.fname)=='function'
+    and type(env.findAsset)=='function'and type(env.makeId)=='function'
+    and type(env.art)=='function'and type(env.component)=='function','skill slot adapter incomplete')
+  if type(slot)~='number'then return nil,'槽位无效' end
+  local asset=env.findAsset(assetId)
+  if not asset then return nil,'未找到技能资产 '..tostring(assetId) end
+  local skillTag=fieldText(asset,'SkillTag')
+  local cooldownTag=fieldText(asset,'SkillCooldownTag')
+  if skillTag=='' then return nil,'技能资产没有 SkillTag' end
+  local cdo=context and context.cdo
+  if cdo then
+    local state=triggerState(env,cdo,skillTag)
+    if state=='mismatch' then return nil,'授予的 GA 不按 '..skillTag..' 触发，写入会锁住按键' end
+  end
+  local sc=env.component(p)
+  if not sc then return nil,'玩家 SkillComponent 不可用' end
+  local list=listOf(sc)
+  if not list then return nil,'SkillComponent.CurSkillDataList 不可用' end
+  if slot<1 or slot>#list then return nil,'玩家只有 '..#list..' 个原版技能槽' end
+  local target=list[slot]
+  local currentTag=fieldText(target,'SkillTag')
+  local actors=actorsOf(sc)
+  local actor=actorFor(env,sc,slot,currentTag)
+  if not env.valid(actor) then
+    return nil,'未找到第 '..slot..' 槽的技能演员（SkillActors='..tostring(actors and #actors or 0)..'），保持原槽位'
+  end
+  local snap=M.snapshot(env,target,actor)
+  local ok,reason=writeTag(env,target,'SkillTag',asset.SkillTag)
+  if not ok then return nil,'槽位标签写入失败：'..tostring(reason) end
+  -- 没有冷却标签的技能（如 Id_Skill_SpellMemory1）要把旧标签清成 None，不能留着上一条技能的冷却。
+  local cooldownText=cooldownTag~=''and cooldownTag or 'None'
+  -- 技能演员必须同步；否则列表指向的技能没有可激活上下文，正是"按键失效"的来源。
+  local data
+  local okData=pcall(function() data=actor.SkillData end)
+  local actorText=''
+  if okData and data~=nil then
+    pcall(function()
+      writeTag(env,data,'SkillTag',asset.SkillTag)
+      writeTagText(env,data,'SkillCooldownTag',cooldownText)
+      data.SlotIndex=slot-1
+      data.Count=1;data.ChargeAmount=0;data.RequiredChargeAmount=0
+    end)
+    actorText=fieldText(data,'SkillTag')
+  end
+  if actorText~=skillTag then
+    writeTagText(env,target,'SkillTag',snap.tag)
+    writeTagText(env,target,'CooldownTag',snap.cooldown~=''and snap.cooldown or 'None')
+    pcall(function()
+      target.RemainDuration=snap.remain or 0.0;target.MaxDuration=snap.max or 0.0;target.StartTime=snap.start or -1.0
+    end)
+    return nil,'技能演员标签写入失败，已回滚槽位'
+  end
+  pcall(function()
+    writeTagText(env,target,'CooldownTag',cooldownText)
+    target.RemainDuration=0.0;target.MaxDuration=0.0;target.StartTime=-1.0
+  end)
+  local id=env.makeId('DesignDataSkill',assetId)
+  if id then pcall(function() data.SkillId=id end) end
+  local art=env.art(asset)
+  if env.valid(art) then pcall(function() actor.ArtDataSkill=art end) end
+  local refreshed=M.refresh(env,sc,actor)
+  return {actor=actor,component=sc,tag=skillTag,cooldown=cooldownTag,previous=currentTag,snapshot=snap,refreshed=refreshed}
+end
+
+-- 移除技能时把槽位还原成添加前的原版数据（原技能能力从未被清除，还原后按键回到原技能）。
+-- 槽位标签已被别的流程改写时不做还原，避免覆盖原版重新生成的数据。
+function M.restore(env,p,record)
+  local snap=record and record.snapshot
+  if not snap or not record.slot then return 'no snapshot' end
+  local sc=env.component(p)
+  if not sc then return 'no component' end
+  local list=listOf(sc)
+  if not list or not list[record.slot] then return 'no slot' end
+  local target=list[record.slot]
+  -- 只有槽位仍是我们写入的那一条才还原；原版重建/别的流程改写过就保持现状。
+  if snap.tag=='' or (record.written and fieldText(target,'SkillTag')~=record.written) then return 'slot changed' end
+  if not writeTagText(env,target,'SkillTag',snap.tag) then return 'tag restore failed' end
+  pcall(function()
+    writeTagText(env,target,'CooldownTag',snap.cooldown~=''and snap.cooldown or 'None')
+    target.RemainDuration=snap.remain or 0.0;target.MaxDuration=snap.max or 0.0;target.StartTime=snap.start or -1.0
+  end)
+  local actor=snap.actor
+  local data=snap.actorData
+  if env.valid(actor)and data then
+    pcall(function()
+      local sd=actor.SkillData
+      writeTagText(env,sd,'SkillTag',data.tag)
+      writeTagText(env,sd,'SkillCooldownTag',data.cooldown~=''and data.cooldown or 'None')
+      if data.idType and data.idName and data.idType~='None' then
+        local id=env.makeId(data.idType,data.idName);if id then sd.SkillId=id end
+      end
+      if data.slotIndex then sd.SlotIndex=data.slotIndex end
+      if data.count then sd.Count=data.count end
+      if data.charge then sd.ChargeAmount=data.charge end
+      if data.required then sd.RequiredChargeAmount=data.required end
+      if data.art then actor.ArtDataSkill=data.art end
+    end)
+  end
+  M.refresh(env,sc,actor)
+  return 'restored'
+end
+
+return M

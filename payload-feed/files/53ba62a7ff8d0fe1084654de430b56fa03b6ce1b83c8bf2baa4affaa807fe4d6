@@ -1,0 +1,18 @@
+"use strict";
+
+const path = require("node:path");
+
+// The launcher passes an absolute game root for a user-selected -NoAC copy.
+// Older/manual launchers only set DARKERLAB_GAME_COPY, so keep that fallback.
+function gameRoot(projectRoot) {
+  const explicit = (process.env.DARKERLAB_GAME_PATH || "").trim();
+  if (explicit) return path.resolve(explicit);
+  const copy = (process.env.DARKERLAB_GAME_COPY || "Dark and Darker-NoAC").trim() || "Dark and Darker-NoAC";
+  return path.resolve(projectRoot, "game", copy);
+}
+
+function gameExecutable(projectRoot) {
+  return path.join(gameRoot(projectRoot), "DungeonCrawler", "Binaries", "Win64", "DungeonCrawler.exe");
+}
+
+module.exports = { gameRoot, gameExecutable };

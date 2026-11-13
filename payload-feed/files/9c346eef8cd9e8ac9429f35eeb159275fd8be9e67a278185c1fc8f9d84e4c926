@@ -1,0 +1,155 @@
+-- Domain module. Generated from the old single-purpose Lua modules.
+local ROOT=assert(os.getenv('DARKERLAB_ROOT'),'DARKERLAB_ROOT is not set')
+local MOD=_G.__DARKERLAB_MOD_DIR or (ROOT..'/game/'..(os.getenv('DARKERLAB_GAME_COPY') or 'Dark and Darker-NoAC')..'/DungeonCrawler/Binaries/Win64/ue4ss/Mods/TrainingCamp/scripts/')
+local function make_Types()
+-- Structural validation shared by every authored monster; no species whitelist.
+local T={}
+function T.valid(o)
+ local ok,v=pcall(function()return o and o:IsValid()end)
+ if not ok or v~=true then return false end
+ local checked,dying=pcall(function()return o:IsActorBeingDestroyed()end)
+ return not(checked and dying==true)
+end
+function T.isA(o,base)
+ if not T.valid(o)then return false end
+ local ok,yes=pcall(function()
+  local c=o:GetClass()
+  for _=1,32 do if not T.valid(c)then return false end;if c:GetFName():ToString()==base then return true end;c=c:GetSuperStruct()end
+  return false
+ end)
+ return ok and yes==true
+end
+function T.identity(o)return o:GetFullName()..' '..tostring(o:GetAddress())end
+function T.world(o)
+ local ok,v=pcall(function()return o:GetOuter().OwningWorld end)
+ if ok and T.valid(v)then return v end
+ local yes,w=pcall(function()return o:GetWorld()end);if yes then return w end
+end
+function T.unwrap(o)local ok,v=pcall(function()return o:get()end);if ok then return v end;return o end
+function T.health(o)
+ if not T.valid(o)then return nil end
+ local ok,v=pcall(function()
+  for i=1,#o.AbilitySystemComponent.SpawnedAttributes do local a=T.unwrap(o.AbilitySystemComponent.SpawnedAttributes[i])
+   if T.valid(a)and a:GetClass():GetFName():ToString()=='DCAttributeSet'then return a.Health.CurrentValue end
+  end
+ end)
+ if ok then return v end
+end
+return T
+
+end
+local Types=make_Types()
+local function make_Positions()
+local ROOT=assert(os.getenv('DARKERLAB_ROOT'),'DARKERLAB_ROOT is not set')
+-- Actual recorded transforms only. No suitability scoring, health or inventory writes.
+local T=Types
+local state=_G.__DARKERLAB_TRAINING_POSITIONS or{entries={},monsters={}}
+_G.__DARKERLAB_TRAINING_POSITIONS=state
+local P={}
+local function capture(actor)
+ assert(T.valid(actor),'Position source actor unavailable')
+ local q=actor:K2_GetActorLocation()
+ return{identity=T.identity(actor),world=T.identity(T.world(actor)),position={X=q.X,Y=q.Y,Z=q.Z}}
+end
+P.snapshot=capture
+function P.captureEntry(player,context,source,snapshot)
+ if not state.entries[context]then local r=snapshot or capture(player);r.source=source;state.entries[context]=r end
+ return state.entries[context]
+end
+function P.captureMonster(actor)
+ local id=T.identity(actor)
+ if not state.monsters[id]then state.monsters[id]=capture(actor)end
+ return state.monsters[id]
+end
+function P.plan(player,current,life)
+ if not current or not current.positionContext or not T.valid(current.actor)then return nil,'No current training group' end
+ local entry=state.entries[current.positionContext]
+ if not entry then return nil,'Training entry position has not been recorded' end
+ local world=T.identity(T.world(player));if entry.world~=world then return nil,'Position snapshot belongs to another world' end
+ local result={{actor=player,origin=entry}}
+ local root=T.identity(current.actor)
+ for _,id in ipairs(life.core.order)do local r=life.core.records[id]
+  if r.root==root and r.phase~='removed'and T.valid(r.actor)then
+   local origin=state.monsters[id]
+   if not origin or origin.world~=world then return nil,'A managed monster has no matching initial position' end
+   result[#result+1]={actor=r.actor,origin=origin}
+  end
+ end
+ if #result<2 then return nil,'No current training monsters' end
+ return result
+end
+function P.reset(player,current,life)
+ local plan,why=P.plan(player,current,life);assert(plan,why)
+ local before={};for i,r in ipairs(plan)do before[i]=capture(r.actor)end
+ local moved=0;local checked={}
+ local ok,e=pcall(function()
+  for i,r in ipairs(plan)do assert(r.actor:K2_SetActorLocation(r.origin.position,false,{},true),'Original actor position reset failed');moved=i end
+  for i,r in ipairs(plan)do
+   local after=capture(r.actor);local q=r.origin.position;local p=after.position
+   local error=math.max(math.abs(p.X-q.X),math.abs(p.Y-q.Y),math.abs(p.Z-q.Z))
+   assert(error<0.01,'Original actor did not reach its recorded position')
+   checked[i]={identity=after.identity,before=before[i].position,origin=q,after=p,error=error}
+  end
+ end)
+ if not ok then for i=moved,1,-1 do pcall(function()plan[i].actor:K2_SetActorLocation(before[i].position,false,{},true)end)end;error(e)end
+ for _,r in ipairs(plan)do
+  pcall(function()if T.valid(r.actor.CharacterMovement)then r.actor.CharacterMovement:StopMovementImmediately()end end)
+ end
+ return{players=1,monsters=#plan-1,context=current.positionContext,positions=checked}
+end
+return P
+
+end
+local Positions=make_Positions()
+local function make_Catalog()
+local ROOT=assert(os.getenv('DARKERLAB_ROOT'),'DARKERLAB_ROOT is not set')
+local BUILD=assert(os.getenv('DARKERLAB_GAME_BUILD'),'DARKERLAB_GAME_BUILD is not set; launch through the build-profile selector')
+-- Cached metadata built once from all current-PAK records, not per-species code.
+local previous=_G.__DARKERLAB_NATIVE_CATALOG
+if previous then assert(previous.build==BUILD,'Game build changed in a live Lua state; restart the game before switching profiles');return previous end
+local C=dofile(ROOT..'/src/build/cache/catalog/profiles/'..BUILD..'/catalog.lua')
+assert(C.schema==1 and C.build==BUILD,'Catalog build mismatch; regenerate the cache from the selected build PAK')
+function C.resolve(key)
+ if C.records[key]then return C.records[key]end
+ local a=C.aliases[key:lower()]
+ assert(a and #a>0,'Monster not found in current-PAK catalog: '..key)
+ assert(#a==1,'Ambiguous monster; select full original ID: '..table.concat(a,','))
+ return C.records[a[1]]
+end
+function C.actorRecord(o)
+ local n=o:GetClass():GetFName():ToString();local candidate=nil
+ for _,r in pairs(C.records)do if r.class==n then
+  if candidate then return nil end;candidate=r
+ end end
+ return candidate
+end
+function C.bossRooms()
+ local seen,rows={},{}
+ for _,r in pairs(C.records)do
+  local kind=tostring(r.class_type or'')
+  if kind:find('Class.Boss',1,true)and not kind:find('SubBoss',1,true)then
+   for _,id in ipairs(r.modules or{})do
+    local module=C.modules[id]
+    if module and not seen[id]and module.levels and(module.levels.SubLevelAssetD or module.levels.SubLevelAssetA)then
+     seen[id]=true
+     local name=tostring(module.name or id):gsub('（Text_.-）$','')
+     rows[#rows+1]={id=id,name=name,module=module}
+    end
+   end
+  end
+ end
+ table.sort(rows,function(a,b)return a.name==b.name and a.id<b.id or a.name<b.name end)
+ return rows
+end
+function C.writeBossRooms()
+ local rows=C.bossRooms()
+ local out={'DARKERLAB_BOSS_ROOMS_V1'}
+ for i,r in ipairs(rows)do out[#out+1]=r.id..'\t'..r.name..'\t'..i..'\t1'end
+ return table.concat(out,'\n')..'\n',#rows
+end
+_G.__DARKERLAB_NATIVE_CATALOG=C
+return C
+
+end
+local Catalog=make_Catalog()
+return {types=Types, positions=Positions, catalog=Catalog}
