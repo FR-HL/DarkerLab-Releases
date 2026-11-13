@@ -2,7 +2,7 @@
     "gameExe":  "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/DungeonCrawler.exe",
     "gameExeSha256":  "32584eeeaf7e5f3ebbde49c17f9cf42f8d1b9a398af3c9234a37bc01c490c2da",
     "version":  "0.3.10",
-    "payloadHash":  "88e1aab268067a79bd50a207912f8d68b7c5e0acb9e5699e5e7497573c5ad302",
+    "payloadHash":  "64d4d882d1ad5c68ff86b99674ee4de5874e38d4c810f6705b335eeba133408c",
     "files":  [
                   {
                       "path":  "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/dwmapi.dll",
@@ -247,22 +247,22 @@
                   {
                       "path":  "src/build/output/native/control_client.dll",
                       "bytes":  618496,
-                      "sha256":  "e7bc20fe2f60396c74d18361f6355d2ea20d37725f1cb4da03a4ac7c01a62e7a"
+                      "sha256":  "2bdaf5f1ee24b84330701ba1398a70323ebe6b22b549995ddbc1e890b5e11272"
                   },
                   {
                       "path":  "src/build/output/native/gui.dll",
                       "bytes":  910336,
-                      "sha256":  "13eeeb0349c55e94db8643cd482cb94e4ecfb9f4d9ae1788371e853e88e53d01"
+                      "sha256":  "8b1fabf356877bedcbf459b7f9efbb927291c10a4a5d32db169c7c990d80ec2a"
                   },
                   {
                       "path":  "src/build/output/native/training_core.dll",
                       "bytes":  625152,
-                      "sha256":  "59fd4da57728d46b41de26490364a81f355e29aeafbfe1c6c3f9699dcb1909f7"
+                      "sha256":  "3841484105b886612715f56ccdeb73f01d195cf32d551e126cf412be9db7f454"
                   },
                   {
                       "path":  "src/build/output/network-policy/network_policy.exe",
                       "bytes":  382464,
-                      "sha256":  "5826aba4990644c06d90696941bf61d493b9e8ae82ede006b374b5b9f631ec49"
+                      "sha256":  "972a01ec59b30db3c71c2bbb656bfd80c61efaa517d91b429b275eb9da99126a"
                   }
               ],
     "deleted":  [
