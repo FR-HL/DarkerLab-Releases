@@ -1,5 +1,5 @@
 {
-  "version": "0.3.10",
+  "version": "0.3.11",
   "gameRoot": "game/Dark and Darker-NoAC",
   "gameExe": "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/DungeonCrawler.exe",
   "files": [

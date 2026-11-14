@@ -1,8 +1,8 @@
 {
     "gameExe":  "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/DungeonCrawler.exe",
     "gameExeSha256":  "32584eeeaf7e5f3ebbde49c17f9cf42f8d1b9a398af3c9234a37bc01c490c2da",
-    "version":  "0.3.10",
-    "payloadHash":  "64d4d882d1ad5c68ff86b99674ee4de5874e38d4c810f6705b335eeba133408c",
+    "version":  "0.3.11",
+    "payloadHash":  "ec6a19c6e0df9a49c77a73b55c50e5d9761081e6e7b9ddab972d0b6975a64744",
     "files":  [
                   {
                       "path":  "game/Dark and Darker-NoAC/DungeonCrawler/Binaries/Win64/dwmapi.dll",
@@ -166,8 +166,8 @@
                   },
                   {
                       "path":  "src/app/server/generated/proto_generated.js",
-                      "bytes":  277528,
-                      "sha256":  "87e1dc055db8c066b12ad5c171c0afb59e6b7e8a12181b30b8c4b5c0c9a4aa68"
+                      "bytes":  3959102,
+                      "sha256":  "f8935b584e077f059726538afe19e8f22eef2789ed9e60c4e9302c2e704964c5"
                   },
                   {
                       "path":  "src/app/server/http_lobby.js",
@@ -242,27 +242,27 @@
                   {
                       "path":  "src/build/config/release-manifest.json",
                       "bytes":  5929,
-                      "sha256":  "1165945edeed5829c77e51abe98ce248496c07cbe76f8e3e6a77b65aa4de5ad6"
+                      "sha256":  "859033a6d4f564196b3da63c847a88a140a3ccc144c0383f3be69522b25da735"
                   },
                   {
                       "path":  "src/build/output/native/control_client.dll",
                       "bytes":  618496,
-                      "sha256":  "2bdaf5f1ee24b84330701ba1398a70323ebe6b22b549995ddbc1e890b5e11272"
+                      "sha256":  "b093ed33e8e2fa4b76e981e7b5685d75887786e3dbe0ab28492b7080945990b5"
                   },
                   {
                       "path":  "src/build/output/native/gui.dll",
                       "bytes":  910336,
-                      "sha256":  "8b1fabf356877bedcbf459b7f9efbb927291c10a4a5d32db169c7c990d80ec2a"
+                      "sha256":  "228e3b103580b7e2b03f8a806aa624e636b168ad2e0efbd39f76f57f1c3f6130"
                   },
                   {
                       "path":  "src/build/output/native/training_core.dll",
                       "bytes":  625152,
-                      "sha256":  "3841484105b886612715f56ccdeb73f01d195cf32d551e126cf412be9db7f454"
+                      "sha256":  "7030cbcaa164142c908ee1b374af7efc7d0f125d9ea0775ae699e255f41129cd"
                   },
                   {
                       "path":  "src/build/output/network-policy/network_policy.exe",
                       "bytes":  382464,
-                      "sha256":  "972a01ec59b30db3c71c2bbb656bfd80c61efaa517d91b429b275eb9da99126a"
+                      "sha256":  "4b3952dfd890968cf22cc93ff0a8b75912dcbcfaf504215c0dff7e20f0e05a4b"
                   }
               ],
     "deleted":  [

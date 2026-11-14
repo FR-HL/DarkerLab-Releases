@@ -1,8 +1,8 @@
 {
     "schema":  1,
-    "version":  "0.3.10",
-    "minLauncher":  "0.3.10",
-    "manifest":  "manifests/0.3.10.json",
-    "manifestSha256":  "b10a6a6230b939c93d5c8a5a811bea5f93d1c8239a198e050f2f162dd9f961fc",
-    "signature":  "BT8idjATxzHKPhpx2Mze8L4XMLDtcfJbyk/WaRq1ZQwR8accU1dRDDcMgOeNH9yd5mhhPMFHAHY025t0t1zJfeYtotPtKmD9ewvJN0dTPdoCvUG7wyVYmu2Q+fec+BbIyeExF/4XuwvwDsGeXnar0EqsV1P5OvsaaOAq7HgeO6/dNohCUIDgB6zu2l8aEcoBRLRZa09uKr/tIakChAv0Xr6OjQ9vRru1K4aT6JCsCKGh86GmzD8b4gO1TX8DoZHqOe0jSrg+XXG2tJ+/k9tQUB6AamAqUrnXH2LQIRIXUyxeydKPl1L7sEXBaE276aqnihpKczbJ4AgTeTy9RlfmCS/khD5vS6IpKfpmo6x7z8+CqnZTp0KfI8mD91JSO5/FYJSPFMAN+Bwb44Enke1AoXueos3c778v1K0FIpaG5uPeCrNiWGE488oPgvfoQf5RZXLQw9r3Uau1mPlN8/xJGaycLn96zfPX+04nAeBJojrd0sMJn2O7gz28PHYV2zRC"
+    "version":  "0.3.11",
+    "minLauncher":  "0.3.11",
+    "manifest":  "manifests/0.3.11.json",
+    "manifestSha256":  "e0b6553a00f082090aa0caa974a0863336dc464b156ffdc18bd843ce82e86aea",
+    "signature":  "gfp8VId2tg33YaWx3MRn8abnjlspc/kZsuouB21aMp6WQPS7HX7I54dPqhqS9pNI/fqJ9azdlwXvqJ2ndSPOXOc+8wHsYMeQ07poP/B4ZDA7mumlXkTowsCPHry2vmF+b4rdMe4soppOuboVAuuWpMG7Clufmlu45IYn5Vzvu/LzbCNYko0n7GXEWjS/awiTFpuvq/V5IV4+cBZQ/DJytMNFze/9fDhxk7DL/jjiSw+uzl9zb/SZqSvAETwKCt6K37ktotp01pCBtzdtNy71gswgPWZ286uL3Mk0+zK+W5HrX1NahQPueH2d9+P5rVQa17yT/y2dEkj812Lje5cxy30vtEKi6x7CKG9g4F0LdOl+KgxC2D6qHozakTCa9/dxs9JQ/jAIWLOJnTl/t6SLmID0M6PPzzN7FdjqIH2gWq7W/E4q8lLVj4P0qWSiEKgMCiW4ef+sLYRaRIyJGQvvYIo5DqXSyF0iSeT10hYL357LxNpN58H/gsTv0nR6cdyj"
 }
